@@ -104,6 +104,13 @@ def test_sequential_pairs_matches_colmap_schedule():
         20, PairingOptions(overlap=3, quadratic_overlap=True)
     )
     assert (0, 4) in pairs and (0, 5) not in pairs
+    # Quadratic means offsets 1, 2, 4 only, not the linear ones in between.
+    assert (0, 3) not in pairs
+    assert len(pairs) == 19 + 18 + 16
+    linear = sequential_pairs(
+        20, PairingOptions(overlap=3, quadratic_overlap=False)
+    )
+    assert (0, 3) in linear and (0, 4) not in linear
 
 
 def _verification():
@@ -181,3 +188,73 @@ def test_colmap_mapper_reconstructs_from_tracks(tmp_path):
     assert errors["ate_rmse_rel"] < 0.01
     # Output is a regular COLMAP model on disk.
     assert (tmp_path / "sparse" / "0" / "points3D.bin").exists()
+
+
+def _extra_features(tracks, rng, num_points=300):
+    """Fake SIFT-like features: another set of static points, [K, 6]."""
+    from coltap.bridge import BridgeFeatures
+    from coltap.database import PairingOptions, sequential_pairs
+
+    num_frames = tracks.num_frames
+    # Re-observe the first ``num_points`` static tracks with sub-pixel noise,
+    # as a second detector would.
+    rows = np.arange(num_points)
+    keypoints, index = {}, np.full((num_points, num_frames), -1)
+    for f in range(num_frames):
+        visible = np.isfinite(tracks.xy[rows, f, 0])
+        xy = tracks.xy[rows[visible], f] + rng.normal(
+            0, 0.2, (visible.sum(), 2)
+        )
+        shape = np.tile([2.0, 0.1, -0.1, 2.0], (len(xy), 1))
+        keypoints[f] = np.hstack([xy, shape]).astype(np.float32)
+        index[rows[visible], f] = np.arange(visible.sum())
+    matches = {}
+    for i, j in sequential_pairs(num_frames, PairingOptions(overlap=5)):
+        both = (index[:, i] >= 0) & (index[:, j] >= 0)
+        matches[(i, j)] = np.stack([index[both, i], index[both, j]], 1).astype(
+            np.uint32
+        )
+    return BridgeFeatures(keypoints=keypoints, matches=matches)
+
+
+def test_hybrid_merges_extra_features(tmp_path):
+    image_dir, tracks, _, gt = _make_sequence(tmp_path, num_frames=12)
+    extra = _extra_features(tracks, np.random.default_rng(3))
+    database_path = tmp_path / "database.db"
+    reader = pycolmap.ImageReaderOptions()
+    reader.camera_model = "SIMPLE_PINHOLE"
+    reader.camera_params = f"{FOCAL},{WIDTH / 2},{HEIGHT / 2}"
+    scores = write_database(
+        tracks,
+        database_path,
+        image_dir,
+        reader_options=reader,
+        pairing=PairingOptions(overlap=5),
+        verification=_verification(),
+        extra_features=extra,
+    )
+    with pycolmap.Database.open(database_path) as db:
+        image_ids = {im.name: im.image_id for im in db.read_all_images()}
+        for f, name in enumerate(tracks.image_names):
+            kps = db.read_keypoints(image_ids[name])
+            n_track = scores.num_track_keypoints[f]
+            assert len(kps) == n_track + len(extra.keypoints[f])
+            assert kps.shape[1] == 6
+            # Track keypoints get an identity affine shape, extra keep theirs.
+            np.testing.assert_allclose(
+                kps[:n_track, 2:], [[1, 0, 0, 1]] * n_track
+            )
+            np.testing.assert_allclose(kps[n_track:], extra.keypoints[f])
+        first, second = tracks.image_names[0], tracks.image_names[1]
+        geometry = db.read_two_view_geometry(
+            image_ids[first], image_ids[second]
+        )
+        inliers = geometry.inlier_matches
+        offset = scores.num_track_keypoints[0]
+        # Both sources contribute inliers to the jointly verified pair.
+        assert (inliers[:, 0] < offset).sum() > 100
+        assert (inliers[:, 0] >= offset).sum() > 100
+    recs = run_mapper(database_path, image_dir, tmp_path / "sparse")
+    rec = largest_reconstruction(recs)
+    assert rec.num_reg_images() == tracks.num_frames
+    assert pose_errors(rec, gt)["rre_max_deg"] < 0.5

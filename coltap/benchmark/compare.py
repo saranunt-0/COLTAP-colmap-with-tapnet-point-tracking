@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""COLMAP (SIFT + sequential matching) vs COLTAP (TAPNext++) on one sequence.
+"""COLMAP (SIFT) vs COLTAP (TAPNext++) vs hybrid on one sequence.
 
     python benchmark/compare.py --image_path data/great_wall/images \
         --workspace_path data/great_wall [--gt_path data/x/gt.json] \
@@ -24,7 +24,16 @@ from coltap.frames import list_images
 from coltap.tracks import Tracks
 from coltap.visualize import load_tracks, render_comparison
 
-METHODS = {"sift": "COLMAP (SIFT)", "tapnext": "COLTAP (TAPNext++)"}
+METHODS = {
+    "sift": "COLMAP (SIFT)",
+    "tapnext": "COLTAP (TAPNext++)",
+    "hybrid": "COLTAP hybrid",
+}
+PANEL_LABELS = {
+    "sift": "COLMAP: SIFT + matching",
+    "tapnext": "COLTAP: TAPNext++ tracks",
+    "hybrid": "Hybrid: TAP (color) + SIFT (gray)",
+}
 
 
 def largest_model(sparse: Path):
@@ -48,13 +57,22 @@ def main():
     parser.add_argument("--gt_path", default="")
     parser.add_argument("--gif", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
+    parser.add_argument(
+        "--methods",
+        default="sift,tapnext,hybrid",
+        help="Comma-separated subset of sift, tapnext, hybrid.",
+    )
     args = parser.parse_args(argv)
+    methods = [m for m in args.methods.split(",") if m]
+    unknown = set(methods) - set(METHODS)
+    if unknown:
+        parser.error(f"Unknown methods: {sorted(unknown)}")
     root = Path(args.workspace_path)
     names = list_images(args.image_path)
     gt = synthetic.load_ground_truth(args.gt_path) if args.gt_path else None
 
     stats, model_paths = {}, {}
-    for method in METHODS:
+    for method in methods:
         ws = root / f"ws_{method}"
         if not (args.skip_existing and (ws / "sparse").exists()):
             code = coltap_main(
@@ -100,11 +118,11 @@ def main():
             pass
 
     (root / "stats.json").write_text(json.dumps(stats, indent=1))
-    keys = [k for k in stats["sift"] if k in stats["tapnext"]]
-    lines = ["| metric | " + " | ".join(METHODS.values()) + " |"]
-    lines.append("|---|" + "---:|" * len(METHODS))
+    keys = [k for k in stats[methods[0]] if all(k in stats[m] for m in methods)]
+    lines = ["| metric | " + " | ".join(METHODS[m] for m in methods) + " |"]
+    lines.append("|---|" + "---:|" * len(methods))
     for key in keys:
-        row = [stats[m][key] for m in METHODS]
+        row = [stats[m][key] for m in methods]
         cells = [f"{v:.4g}" if isinstance(v, float) else str(v) for v in row]
         lines.append(f"| {key} | " + " | ".join(cells) + " |")
     (root / "results.md").write_text("\n".join(lines) + "\n")
@@ -112,24 +130,19 @@ def main():
     if "tapnext_track_accuracy" in stats:
         print("TAPNext++ 2D track accuracy:", stats["tapnext_track_accuracy"])
 
-    if len(model_paths) == 2:
-        outputs = [root / "compare.mp4"] + (
-            [root / "compare.gif"] if args.gif else []
-        )
+    if len(model_paths) >= 2:
+        outputs = [root / "compare.mp4"]
+        if args.gif:
+            outputs.append(root / "compare.gif")
         render_comparison(
             args.image_path,
             [
-                (
-                    "COLMAP: SIFT + matching",
-                    load_tracks(model_paths["sift"], names),
-                ),
-                (
-                    "COLTAP: TAPNext++ tracks",
-                    load_tracks(model_paths["tapnext"], names),
-                ),
+                (PANEL_LABELS[m], load_tracks(model_paths[m], names))
+                for m in methods
+                if m in model_paths
             ],
             outputs,
-            width=360,
+            width=360 if len(model_paths) == 2 else 300,
             fps=10,
             tail=12,
             image_names=names,

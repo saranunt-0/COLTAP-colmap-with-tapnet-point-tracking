@@ -20,6 +20,7 @@ from .database import (
 )
 from .frames import ImageSequence, list_images
 from .model import TapNextPP
+from .sift import colmap_sift_features
 from .tracking import TrackingOptions, track_sequence
 from .tracks import Tracks
 
@@ -57,22 +58,48 @@ class TrackerOptions:
     num_threads: int = -1
 
 
+TRACKERS = ("tapnext", "sift", "hybrid")
+
+
 def run_feature_tracker(
     image_path: str | Path,
     database_path: str | Path,
     options: TrackerOptions | None = None,
     image_names: list[str] | None = None,
     tracks_path: str | Path | None = None,
-) -> tuple[Tracks, TrackScores]:
+    tracker: str = "tapnext",
+) -> tuple[Tracks | None, TrackScores | None]:
     """Drop-in replacement for ``feature_extractor`` + ``sequential_matcher``.
 
-    Reads the ordered images in ``image_path``, tracks points with TAPNext++
-    and writes cameras, images, keypoints, matches and verified two-view
-    geometries to ``database_path``. Optionally saves the raw tracks and
-    per-track scores next to ``tracks_path`` (``.npz``).
+    Writes cameras, images, keypoints, matches and verified two-view
+    geometries for the ordered images in ``image_path`` to ``database_path``.
+
+    ``tracker`` selects the correspondence source:
+
+    * ``"tapnext"``: TAPNext++ point tracks (COLTAP);
+    * ``"sift"``: stock COLMAP (SIFT + sequential matching);
+    * ``"hybrid"``: both, merged into one database. Every image pair is
+      verified jointly on TAPNext++ and SIFT correspondences, so TAPNext++
+      contributes long tracks and coverage of weak texture, SIFT many
+      features on strong texture and wide-baseline matches.
+
+    For the TAPNext++ modes the raw tracks and per-track scores can be saved
+    to ``tracks_path`` (``.npz``, scores in ``<stem>_scores.npz``).
     """
+    if tracker not in TRACKERS:
+        raise ValueError(f"Unknown tracker {tracker!r}, use one of {TRACKERS}")
     options = options or TrackerOptions()
     names = image_names or list_images(image_path)
+    if tracker == "sift":
+        run_sift_baseline(
+            image_path,
+            database_path,
+            camera_mode=options.camera_mode,
+            reader=options.reader,
+            pairing=options.pairing,
+            image_names=names,
+        )
+        return None, None
     mask_path = str(options.reader.mask_path)
     sequence = ImageSequence(
         image_path,
@@ -97,6 +124,17 @@ def run_feature_tracker(
     )
     tracks = track_sequence(sequence, model, options.tracking)
     del model
+    extra = None
+    if tracker == "hybrid":
+        extra = colmap_sift_features(
+            image_path,
+            names,
+            Path(database_path).with_suffix(".sift.db"),
+            camera_mode=options.camera_mode,
+            reader_options=options.reader,
+            overlap=options.pairing.overlap,
+            quadratic_overlap=options.pairing.quadratic_overlap,
+        )
     scores = write_database(
         tracks,
         database_path,
@@ -108,6 +146,7 @@ def run_feature_tracker(
         verification=options.verification,
         num_threads=options.num_threads,
         bridge=options.bridge,
+        extra_features=extra,
     )
     if tracks_path:
         tracks_path = Path(tracks_path)
@@ -170,32 +209,22 @@ def automatic_reconstruction(
 ) -> dict[int, pycolmap.Reconstruction]:
     """Sparse reconstruction with COLMAP's workspace layout.
 
-    ``workspace/database.db``, ``workspace/sparse/<k>/`` and, for COLTAP,
-    ``workspace/tracks.npz`` + ``workspace/tracks_scores.npz``.
+    ``workspace/database.db``, ``workspace/sparse/<k>/`` and, for the
+    TAPNext++ trackers, ``workspace/tracks.npz`` + ``tracks_scores.npz``.
+    ``tracker`` is ``"tapnext"``, ``"sift"`` or ``"hybrid"``.
     """
     workspace = Path(workspace_path)
     workspace.mkdir(parents=True, exist_ok=True)
     database_path = workspace / "database.db"
-    tracker_options = tracker_options or TrackerOptions()
     timings = {}
     tic = time.time()
-    if tracker == "tapnext":
-        run_feature_tracker(
-            image_path,
-            database_path,
-            tracker_options,
-            tracks_path=workspace / "tracks.npz",
-        )
-    elif tracker == "sift":
-        run_sift_baseline(
-            image_path,
-            database_path,
-            camera_mode=tracker_options.camera_mode,
-            reader=tracker_options.reader,
-            pairing=tracker_options.pairing,
-        )
-    else:
-        raise ValueError(f"Unknown tracker {tracker!r} (tapnext | sift)")
+    run_feature_tracker(
+        image_path,
+        database_path,
+        tracker_options,
+        tracks_path=workspace / "tracks.npz",
+        tracker=tracker,
+    )
     timings["correspondences_s"] = time.time() - tic
     tic = time.time()
     reconstructions = run_mapper(

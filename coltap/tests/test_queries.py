@@ -36,15 +36,25 @@ def test_detect_corners_uses_colmap_pixel_convention():
     np.testing.assert_allclose(corners, reference + 0.5)
 
 
+def _cell_centers(grid, cells):
+    rows, cols = grid.shape
+    return np.stack(
+        [
+            (np.asarray(cells) % cols + 0.5) * grid.cell_size,
+            (np.asarray(cells) // cols + 0.5) * grid.cell_size,
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+
 def test_select_queries_fills_free_cells_uniformly():
     image = synthetic.procedural_texture(256, seed=3)
     grid = CoverageGrid.create(256, 256, num_cells_long_side=8)
-    occupied = np.zeros(grid.shape[0] * grid.shape[1], bool)
-    occupied[:32] = True  # top half already covered
-    queries = select_queries(image, grid, occupied, max_queries=1000)
+    live = _cell_centers(grid, range(32))  # top half already tracked
+    queries = select_queries(image, grid, live, max_queries=1000)
     cells = grid.cell_index(queries)
     assert len(queries) > 0
-    assert (cells >= 32).all(), "queries must avoid occupied cells"
+    assert (cells >= 32).all(), "queries must avoid cells at their quota"
     # One query per cell by default -> no duplicate cells.
     assert len(np.unique(cells)) == len(cells)
     # Bottom half should be (nearly) fully covered.
@@ -54,9 +64,63 @@ def test_select_queries_fills_free_cells_uniformly():
 def test_select_queries_respects_mask_and_budget():
     image = synthetic.procedural_texture(128, seed=4)
     grid = CoverageGrid.create(128, 128, num_cells_long_side=8)
-    occupied = np.zeros(64, bool)
     mask = np.zeros((128, 128), bool)
     mask[:, 64:] = True
-    queries = select_queries(image, grid, occupied, max_queries=5, mask=mask)
+    queries = select_queries(
+        image, grid, np.zeros((0, 2)), max_queries=5, mask=mask
+    )
     assert len(queries) <= 5
     assert (queries[:, 0] >= 64).all()
+
+
+def _half_textured_image(size=256):
+    """Left half: strong texture. Right half: the same pattern at 10 %
+    contrast (weak texture, e.g. hazy terrain)."""
+    image = synthetic.procedural_texture(size, seed=5).astype(np.float32)
+    left = image[:, : size // 2]
+    image[:, size // 2 :] = left.mean() + 0.1 * (left - left.mean())
+    return image.astype(np.uint8)
+
+
+def test_adaptive_sampling_densifies_textured_cells_only():
+    image = _half_textured_image()
+    grid = CoverageGrid.create(256, 256, num_cells_long_side=8)
+    uniform = select_queries(image, grid, np.zeros((0, 2)), 10000)
+    adaptive = select_queries(
+        image,
+        grid,
+        np.zeros((0, 2)),
+        10000,
+        max_per_cell=4,
+        texture_threshold=0.05,
+    )
+    left = adaptive[:, 0] < 128
+    # Textured cells get several queries, faint cells keep coverage only.
+    assert left.sum() > 2.5 * (uniform[:, 0] < 128).sum()
+    right_cells = grid.cell_index(adaptive[~left])
+    assert np.bincount(right_cells).max() <= 1
+    assert len(np.unique(right_cells)) >= 0.75 * 32  # still covered
+
+
+def test_new_queries_keep_distance_from_live_tracks():
+    image = synthetic.procedural_texture(256, seed=6)
+    grid = CoverageGrid.create(256, 256, num_cells_long_side=8)
+    live = np.array([[50.0, 50.0], [150.0, 120.0]], np.float32)
+    queries = select_queries(
+        image, grid, live, 10000, max_per_cell=4, min_distance=10.0
+    )
+    dist = np.linalg.norm(queries[:, None] - live[None], axis=-1)
+    assert dist.min() >= 9.0
+    pairwise = np.linalg.norm(queries[:, None] - queries[None], axis=-1)
+    np.fill_diagonal(pairwise, np.inf)
+    assert pairwise.min() >= 8.0
+
+
+def test_sift_detector_queries():
+    image = synthetic.procedural_texture(256, seed=7)
+    grid = CoverageGrid.create(256, 256, num_cells_long_side=8)
+    queries = select_queries(
+        image, grid, np.zeros((0, 2)), 10000, max_per_cell=3, detector="sift"
+    )
+    assert len(queries) > 64
+    assert np.bincount(grid.cell_index(queries)).max() <= 3

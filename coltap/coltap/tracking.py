@@ -42,10 +42,21 @@ LOGGER = logging.getLogger(__name__)
 @dataclasses.dataclass
 class TrackingOptions:
     # Grid used for query placement and coverage: number of cells along the
-    # long image side, and new queries per free cell.
+    # long image side. Every cell gets ``queries_per_cell`` queries wherever
+    # there is any texture (coverage); textured cells are filled further, up
+    # to ``max_queries_per_cell``, with corners scoring at least
+    # ``texture_threshold`` x the image's 95th-percentile corner score.
     grid_cells: int = 24
     queries_per_cell: int = 1
-    max_queries_per_instance: int = 800
+    max_queries_per_cell: int = 1
+    texture_threshold: float = 0.05
+    # Where queries go: "shi_tomasi" corners or "sift" keypoint locations.
+    query_detector: str = "shi_tomasi"
+    # Minimum distance (px) between queries and live tracks; 0 = cell / 4.
+    query_min_distance: float = 0.0
+    # Shi-Tomasi floor relative to the image's strongest corner.
+    min_corner_quality: float = 1e-4
+    max_queries_per_instance: int = 2000
     min_queries_per_instance: int = 16
     # Start a new tracker instance when the fraction of grid cells covered by
     # live, confident tracks drops below this value...
@@ -176,7 +187,8 @@ def track_sequence(
 
         # 2. Decide whether to start a new instance.
         valid = grid.valid_cells(mask)
-        occupied = _occupancy(grid, active, t, options.min_confidence)
+        live_xy = _live_points(active, t, options.min_confidence)
+        occupied = grid.occupancy(live_xy)
         coverage = (occupied & valid).sum() / max(valid.sum(), 1)
         since = t - last_seed
         if not (
@@ -203,16 +215,23 @@ def track_sequence(
             keep = oldest.confidence(t) >= options.handoff_min_confidence
             handoff_xy = oldest.xy[t][keep]
             handoff_ids = oldest.track_ids[keep]
-            occupied = _occupancy(grid, active, t, options.min_confidence)
-            occupied |= grid.occupancy(handoff_xy)
+            live_xy = np.concatenate(
+                [_live_points(active, t, options.min_confidence), handoff_xy]
+            )
 
-        # 4. New corners in uncovered cells.
+        # 4. New queries where cells are below their quota.
         new_xy = select_queries(
             image,
             grid,
-            occupied | ~valid,
+            live_xy,
             max(options.max_queries_per_instance - len(handoff_xy), 0),
+            valid_cells=valid,
             per_cell=options.queries_per_cell,
+            max_per_cell=options.max_queries_per_cell,
+            texture_threshold=options.texture_threshold,
+            detector=options.query_detector,
+            min_distance=options.query_min_distance,
+            min_corner_quality=options.min_corner_quality,
             mask=mask,
         )
         if len(new_xy) + len(handoff_xy) < options.min_queries_per_instance:
@@ -272,12 +291,16 @@ def track_sequence(
     return tracks
 
 
-def _occupancy(grid, active, t, min_confidence) -> np.ndarray:
+def _live_points(active, t, min_confidence) -> np.ndarray:
+    """Positions of confidently tracked points of all live instances."""
     points = [
         inst.xy[t][inst.confidence(t) >= min_confidence] for inst in active
     ]
-    points = np.concatenate(points) if points else np.zeros((0, 2))
-    return grid.occupancy(points)
+    return (
+        np.concatenate(points).astype(np.float32)
+        if points
+        else np.zeros((0, 2), np.float32)
+    )
 
 
 def _assemble(instances, query_frame, names, sizes) -> Tracks:

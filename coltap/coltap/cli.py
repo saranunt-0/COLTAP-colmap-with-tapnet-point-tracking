@@ -3,10 +3,11 @@
 
 COLTAP-specific commands:
 
-  feature_tracker         TAPNext++ tracking -> COLMAP database. Replaces
+  feature_tracker         Correspondences -> COLMAP database. Replaces
                           ``colmap feature_extractor`` + ``colmap *_matcher``
                           for ordered image sequences / videos.
-  automatic_reconstructor Tracking (or SIFT baseline) + COLMAP mapper.
+                          ``--tracker tapnext | sift | hybrid``.
+  automatic_reconstructor feature_tracker + COLMAP mapper.
   mapper                  COLMAP incremental mapper (via pycolmap).
   extract_frames          Decode a video into an image folder.
   visualize_tracks        Render tracks of a database/model/tracks file.
@@ -37,6 +38,7 @@ from .bridge import BridgeOptions
 from .database import PairingOptions, SelectionOptions
 from .frames import extract_video_frames
 from .pipeline import (
+    TRACKERS,
     ModelOptions,
     TrackerOptions,
     automatic_reconstruction,
@@ -46,6 +48,11 @@ from .pipeline import (
 from .tracking import TrackingOptions
 
 LOGGER = logging.getLogger("coltap")
+
+_TRACKER_HELP = (
+    "tapnext: TAPNext++ tracks (COLTAP); sift: stock COLMAP SIFT + "
+    "sequential matching; hybrid: both merged into one database."
+)
 
 
 def _parse_bool(value: str) -> bool:
@@ -209,8 +216,8 @@ def _mapper_options(extra: list[str]) -> pycolmap.IncrementalPipelineOptions:
 def cmd_feature_tracker(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="coltap feature_tracker",
-        description="Track points with TAPNext++ and write a COLMAP database "
-        "(replaces feature_extractor + sequential_matcher).",
+        description="Track points (TAPNext++, SIFT or both) and write a "
+        "COLMAP database (replaces feature_extractor + sequential_matcher).",
     )
     parser.add_argument("--database_path", required=True)
     parser.add_argument("--image_path", required=True)
@@ -218,6 +225,9 @@ def cmd_feature_tracker(argv: list[str]) -> int:
         "--tracks_path",
         default="",
         help="Optional .npz to store raw tracks (+ _scores.npz).",
+    )
+    parser.add_argument(
+        "--tracker", default="tapnext", choices=TRACKERS, help=_TRACKER_HELP
     )
     _add_tracker_args(parser)
     args = parser.parse_args(argv)
@@ -227,6 +237,7 @@ def cmd_feature_tracker(argv: list[str]) -> int:
         args.database_path,
         _tracker_options(args),
         tracks_path=args.tracks_path or None,
+        tracker=args.tracker,
     )
     return 0
 
@@ -262,8 +273,8 @@ def cmd_automatic_reconstructor(argv: list[str]) -> int:
     parser.add_argument(
         "--tracker",
         default="tapnext",
-        choices=["tapnext", "sift"],
-        help="tapnext (COLTAP) or sift (stock COLMAP correspondences).",
+        choices=TRACKERS,
+        help=_TRACKER_HELP,
     )
     parser.add_argument(
         "--dense",

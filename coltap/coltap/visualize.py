@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""Track visualizations: single sequence and COLMAP-vs-COLTAP side by side.
+"""Track visualizations: single sequence and COLMAP / COLTAP side by side.
 
 Tracks can come from
 
@@ -28,6 +28,9 @@ class FrameTracks:
     ids: list[np.ndarray]
     xy: list[np.ndarray]
     label: str = ""
+    # Optional per-frame bool arrays: True for observations that come from
+    # TAPNext++ tracks, False for SIFT features (hybrid models).
+    from_tracks: list[np.ndarray] | None = None
 
     @property
     def num_frames(self) -> int:
@@ -38,25 +41,53 @@ class FrameTracks:
         return dict(zip(ids.tolist(), counts.tolist(), strict=True))
 
 
+def _track_keypoint_counts(model_path: Path) -> dict[str, int] | None:
+    """Per image, how many keypoints came from tracks (rest: SIFT).
+
+    Read from the COLTAP workspace that holds the model
+    (``<workspace>/sparse/<k>`` next to ``<workspace>/tracks*.npz``).
+    Returns None for stock COLMAP or pure TAPNext++ workspaces.
+    """
+    workspace = Path(model_path).parent.parent
+    scores_path = workspace / "tracks_scores.npz"
+    tracks_path = workspace / "tracks.npz"
+    if not (scores_path.exists() and tracks_path.exists()):
+        return None
+    with np.load(scores_path) as scores, np.load(tracks_path) as tracks:
+        if "num_track_keypoints" not in scores:
+            return None
+        counts = scores["num_track_keypoints"]
+        names = [str(n) for n in tracks["image_names"]]
+    return dict(zip(names, counts.tolist(), strict=True))
+
+
 def tracks_from_model(model_path: str | Path, image_names: list[str]):
     import pycolmap
 
     rec = pycolmap.Reconstruction(str(model_path))
+    counts = _track_keypoint_counts(Path(model_path))
     frame_of = {name: i for i, name in enumerate(image_names)}
     per_frame: list[list[tuple[int, float, float]]] = [[] for _ in image_names]
+    origin: list[list[bool]] = [[] for _ in image_names]
     for image in rec.images.values():
         if not image.has_pose or image.name not in frame_of:
             continue
         f = frame_of[image.name]
-        for p2d in image.points2D:
+        num_track_kps = counts.get(image.name, 0) if counts else 0
+        for idx, p2d in enumerate(image.points2D):
             if p2d.has_point3D():
                 per_frame[f].append((p2d.point3D_id, *p2d.xy))
+                origin[f].append(idx < num_track_kps)
+    hybrid = counts is not None and any(
+        not o for frame in origin for o in frame
+    )
     return FrameTracks(
         ids=[np.array([o[0] for o in obs], np.int64) for obs in per_frame],
         xy=[
             np.array([o[1:] for o in obs], np.float32).reshape(-1, 2)
             for obs in per_frame
         ],
+        from_tracks=[np.array(o, bool) for o in origin] if hybrid else None,
     )
 
 
@@ -113,6 +144,15 @@ def draw_tracks(
     if len(ids) == 0:
         return canvas
     colors = _colors(ids)
+    radius = np.full(len(ids), 2.0)
+    order = np.arange(len(ids))
+    if tracks.from_tracks is not None:
+        # Hybrid: SIFT tracks are drawn first, small and light gray; the
+        # TAPNext++ tracks keep their colors and are drawn on top.
+        sift = ~tracks.from_tracks[frame]
+        colors[sift] = (215, 215, 215)
+        radius[sift] = 1.25
+        order = np.argsort(~sift, kind="stable")
     history = np.full((len(ids), tail + 1, 2), np.nan, np.float32)
     history[:, -1] = tracks.xy[frame]
     index = {tid: k for k, tid in enumerate(ids.tolist())}
@@ -126,7 +166,7 @@ def draw_tracks(
                 history[k, tail - back] = xy
     shift = 4
     fixed = (history * scale * (1 << shift)).round()
-    for k in range(len(ids)):
+    for k in order:
         color = tuple(int(c) for c in colors[k])
         valid = np.isfinite(fixed[k, :, 0])
         pts = fixed[k][valid].astype(np.int32)
@@ -137,7 +177,7 @@ def draw_tracks(
         cv2.circle(
             canvas,
             tuple(pts[-1]),
-            int(2 * (1 << shift)),
+            int(radius[k] * (1 << shift)),
             color,
             -1,
             cv2.LINE_AA,
@@ -164,12 +204,12 @@ def _panel(image, tracks: FrameTracks, frame, tail, scale, lengths, label):
     line = int(20 * size / 0.45)
     header = np.full((2 * line + 8, panel.shape[1], 3), 24, np.uint8)
     _put_text(header, label, (8, line), size, (255, 220, 120))
-    _put_text(
-        header,
-        f"points in frame: {len(ids)}   mean track length: {mean_len:.1f}",
-        (8, 2 * line),
-        size * 0.9,
-    )
+    stats = f"points: {len(ids)}"
+    if tracks.from_tracks is not None:
+        n_tap = int(tracks.from_tracks[frame].sum())
+        stats += f" (TAP {n_tap}+SIFT {len(ids) - n_tap})"
+    stats += f"  track len: {mean_len:.0f}"
+    _put_text(header, stats, (8, 2 * line), size * 0.9)
     return np.concatenate([header, panel], axis=0)
 
 
@@ -301,8 +341,17 @@ def main_compare(argv: list[str]) -> int:
         required=True,
         help="COLTAP sparse model (or tracks.npz)",
     )
+    parser.add_argument(
+        "--hybrid_path",
+        default="",
+        help="Optional third panel: COLTAP hybrid model (TAP colored, SIFT "
+        "gray)",
+    )
     parser.add_argument("--colmap_label", default="COLMAP: SIFT + matching")
     parser.add_argument("--coltap_label", default="COLTAP: TAPNext++ tracks")
+    parser.add_argument(
+        "--hybrid_label", default="Hybrid: TAP (color) + SIFT (gray)"
+    )
     parser.add_argument(
         "--output_path",
         nargs="+",
@@ -319,6 +368,10 @@ def main_compare(argv: list[str]) -> int:
         (args.colmap_label, load_tracks(args.colmap_path, names)),
         (args.coltap_label, load_tracks(args.coltap_path, names)),
     ]
+    if args.hybrid_path:
+        sources.append(
+            (args.hybrid_label, load_tracks(args.hybrid_path, names))
+        )
     render_comparison(
         args.image_path,
         sources,

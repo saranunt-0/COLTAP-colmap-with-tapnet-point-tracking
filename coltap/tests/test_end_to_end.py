@@ -33,7 +33,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_cli_automatic_reconstructor_on_synthetic_scene(tmp_path):
+@pytest.mark.parametrize("tracker", ["tapnext", "hybrid"])
+def test_cli_automatic_reconstructor_on_synthetic_scene(tmp_path, tracker):
     textures = [synthetic.procedural_texture(512, seed=s) for s in range(6)]
     scene = synthetic.Scene(textures, texels_per_unit=120.0)
     camera = synthetic.Camera(width=320, height=240, focal=250.0)
@@ -50,6 +51,8 @@ def test_cli_automatic_reconstructor_on_synthetic_scene(tmp_path):
             str(workspace),
             "--TapTracker.grid_cells",
             "16",
+            "--tracker",
+            tracker,
         ]
     )
     assert code == 0
@@ -59,6 +62,14 @@ def test_cli_automatic_reconstructor_on_synthetic_scene(tmp_path):
         assert db.num_images() == 12
         assert db.num_keypoints() > 0
         assert db.num_verified_image_pairs() > 0
+        num_keypoints = db.num_keypoints()
+    scores = np.load(workspace / "tracks_scores.npz")
+    num_track_keypoints = int(scores["num_track_keypoints"].sum())
+    if tracker == "hybrid":
+        assert num_keypoints > num_track_keypoints  # SIFT appended
+        assert not (workspace / "database.sift.db").exists()
+    else:
+        assert num_keypoints == num_track_keypoints
     rec = largest_reconstruction(
         {
             int(p.name): pycolmap.Reconstruction(p)

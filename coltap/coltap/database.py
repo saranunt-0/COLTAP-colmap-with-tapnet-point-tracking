@@ -13,7 +13,9 @@ The database written here has exactly the layout produced by
   (``pycolmap.estimate_two_view_geometry``) of those matches.
 
 Where the track graph is broken (a cut or a jump in the input), SIFT matches
-are added in a small window around the break (``bridge.py``).
+are added in a small window around the break (``bridge.py``). In hybrid mode
+COLMAP's SIFT features and matches are merged for every image pair
+(``sift.py``).
 
 Descriptors are not written: the mapper and all later stages do not use them.
 
@@ -43,7 +45,7 @@ import numpy as np
 
 import pycolmap
 
-from .bridge import BridgeOptions, compute_bridges
+from .bridge import BridgeFeatures, BridgeOptions, compute_bridges
 from .frames import ImageSequence
 from .tracks import Tracks
 
@@ -83,24 +85,29 @@ class TrackScores:
     static_score: np.ndarray  # [N] inlier_pairs / verified_pairs
     weight: np.ndarray  # [N]
     selected: np.ndarray  # [N] bool, written to the database
+    # [T] keypoints per image that come from tracks; any keypoints after
+    # them are SIFT features (hybrid mode or gap bridge).
+    num_track_keypoints: np.ndarray
 
     def save(self, path: str | Path) -> None:
         np.savez_compressed(path, **dataclasses.asdict(self))
 
 
 def sequential_pairs(num_images: int, options: PairingOptions):
-    """Image index pairs (i < j), mirroring COLMAP's SequentialPairGenerator."""
-    pairs = set()
+    """Image index pairs (i < j) as made by COLMAP's sequential matcher.
+
+    With ``quadratic_overlap`` image i is paired with i + 2^k for
+    k < ``overlap`` (i.e. i+1, i+2, i+4, ...); otherwise with i+1 ... i+overlap
+    (src/colmap/controllers/pairing.cc).
+    """
+    pairs = []
     for i in range(num_images):
         for k in range(options.overlap):
-            j = i + k + 1
-            if j < num_images:
-                pairs.add((i, j))
-            if options.quadratic_overlap:
-                j = i + (1 << k)
-                if j < num_images:
-                    pairs.add((i, j))
-    return sorted(pairs)
+            j = i + (1 << k) if options.quadratic_overlap else i + k + 1
+            if j >= num_images:
+                break
+            pairs.append((i, j))
+    return pairs
 
 
 def _import_images(
@@ -151,8 +158,15 @@ def write_database(
     verification: pycolmap.TwoViewGeometryOptions | None = None,
     num_threads: int = -1,
     bridge: BridgeOptions | None = None,
+    extra_features: BridgeFeatures | None = None,
 ) -> TrackScores:
-    """Write tracks as keypoints + verified matches into a COLMAP database."""
+    """Write tracks as keypoints + verified matches into a COLMAP database.
+
+    ``extra_features`` (hybrid mode) are additional keypoints and raw matches
+    per frame pair, e.g. COLMAP's SIFT features (``sift.py``). They are
+    appended to each image's keypoints, and every pair they cover is verified
+    jointly with the track matches. The gap bridge is not needed then.
+    """
     database_path = Path(database_path)
     selection = selection or SelectionOptions()
     pairing = pairing or PairingOptions()
@@ -193,11 +207,24 @@ def write_database(
     conf = np.where(observed, tracks.confidence, 0.0)
     mean_conf = conf.sum(axis=1) / np.maximum(num_obs, 1)
 
-    # 3. Static score from COLMAP's two-view geometric verification.
+    # 3. Static score from COLMAP's two-view geometric verification. The
+    # score is a vote over image pairs, so it uses more pairs than are
+    # written to the database: COLMAP's schedule plus the dense window
+    # i+1 ... i+overlap (more votes per track, better separation of moving
+    # points). Only COLMAP's schedule is written, as its matcher would.
     pairs = sequential_pairs(tracks.num_frames, pairing)
+    score_pairs = sorted(
+        set(pairs)
+        | set(
+            sequential_pairs(
+                tracks.num_frames,
+                PairingOptions(pairing.overlap, quadratic_overlap=False),
+            )
+        )
+    )
     pair_tracks, pair_inputs, pair_ids = [], [], []
     xy64 = tracks.xy.astype(np.float64)
-    for i, j in pairs:
+    for i, j in score_pairs:
         shared = np.nonzero(observed[:, i] & observed[:, j])[0]
         if len(shared) < verification.min_num_inliers:
             continue
@@ -240,13 +267,13 @@ def write_database(
         selected &= observed.sum(axis=1) >= 2
     observed &= selected[:, None]
 
-    # 5. Bridge breaks in the track graph with SIFT (see bridge.py).
-    bridges = None
-    if bridge is not None and bridge.enabled:
+    # 5. Extra features: hybrid SIFT, or the gap bridge (see bridge.py).
+    bridges = extra_features
+    if bridges is None and bridge is not None and bridge.enabled:
         sequence = ImageSequence(image_path, names)
         bridges = compute_bridges(observed, sequence, bridge, pairs)
 
-    # Keypoints: kept track observations first, then bridge SIFT features.
+    # Keypoints: kept track observations first, then the extra features.
     keypoint_index = np.full(observed.shape, -1, np.int64)
     keypoints, sift_offset = [], np.zeros(tracks.num_frames, np.uint32)
     for f in range(tracks.num_frames):
@@ -255,14 +282,17 @@ def write_database(
         kps = tracks.xy[rows, f]
         sift_offset[f] = len(rows)
         if bridges is not None and f in bridges.keypoints:
-            kps = np.concatenate([kps, bridges.keypoints[f]])
+            kps = _stack_keypoints(kps, bridges.keypoints[f])
         keypoints.append(kps.astype(np.float32))
 
     # Final matches per pair: (raw matches, two-view geometry).
     final = {}
+    database_pairs = set(pairs)
     for (i, j), shared, geometry in zip(
         pair_ids, pair_tracks, geometries, strict=True
     ):
+        if (i, j) not in database_pairs:
+            continue
         kp_i = keypoint_index[shared, i]
         kp_j = keypoint_index[shared, j]
         raw = (kp_i >= 0) & (kp_j >= 0)
@@ -294,9 +324,9 @@ def write_database(
             bridge_inputs.append(
                 (
                     image_cams[i],
-                    keypoints[i].astype(np.float64),
+                    keypoints[i][:, :2].astype(np.float64),
                     image_cams[j],
-                    keypoints[j].astype(np.float64),
+                    keypoints[j][:, :2].astype(np.float64),
                     matches,
                 )
             )
@@ -317,12 +347,13 @@ def write_database(
     num_written = len(final)
 
     LOGGER.info(
-        "Database: %d/%d tracks selected (%d candidates), %d keypoints, "
-        "%d image pairs",
+        "Database: %d/%d tracks selected (%d candidates), %d track + %d "
+        "SIFT keypoints, %d image pairs",
         selected.sum(),
         tracks.num_tracks,
         candidate.sum(),
         observed.sum(),
+        sum(len(k) for k in keypoints) - observed.sum(),
         num_written,
     )
     return TrackScores(
@@ -333,4 +364,17 @@ def write_database(
         static_score=static.astype(np.float32),
         weight=weight.astype(np.float32),
         selected=selected,
+        num_track_keypoints=sift_offset.astype(np.int32),
     )
+
+
+def _stack_keypoints(track_xy: np.ndarray, extra: np.ndarray) -> np.ndarray:
+    """Concatenate track keypoints (x, y) with extra keypoints.
+
+    If the extra keypoints carry an affine shape ([K, 6], as COLMAP's SIFT
+    does), track keypoints get an identity shape so all rows have 6 columns.
+    """
+    if extra.shape[1] == 2:
+        return np.concatenate([track_xy, extra])
+    shape = np.tile([1.0, 0.0, 0.0, 1.0], (len(track_xy), 1))
+    return np.concatenate([np.hstack([track_xy, shape]), extra[:, :6]])
