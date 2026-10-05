@@ -1,4 +1,8 @@
 line-length = 80
+# Vendored third-party code keeps its upstream formatting. force-exclude makes
+# the exclusion apply to files passed explicitly (scripts/format/python.sh).
+extend-exclude = ["coltap/coltap/third_party"]
+force-exclude = true
 
 [lint]
 select = [
@@ -16,6 +20,9 @@ select = [
     "I",
 ]
 ignore = ["SIM117"]
+
+[lint.isort]
+known-first-party = ["coltap"]
 
 [lint.per-file-ignores]
 "scripts/python/*.py" = ["E", "SIM", "UP", "B"]
