@@ -1,6 +1,12 @@
 COLMAP
 ======
 
+> **COLTAP (this fork):** [`coltap/`](coltap/) adds DeepMind's TAPNext++ point
+> tracker as a drop-in replacement for COLMAP's feature extraction + matching
+> on ordered image sequences / videos. It writes a standard COLMAP database, so
+> the mapper and all downstream modules run unchanged. See
+> [`coltap/README.md`](coltap/README.md) for usage, results and limitations.
+
 About
 -----
 
