@@ -131,3 +131,87 @@ See `development_note/architecture.md`.
   residuals) feeding the same `static_score`.
 - Per-observation weights in bundle adjustment (needs a custom BA loop in
   pycolmap; COLMAP's mapper treats all observations equally).
+
+---
+
+## [2026-10-05] Feature density investigation, adaptive sampling, hybrid mode
+
+**Type**: `investigation` + `feature`
+**Status**: `resolved` (one open sub-question, see Uncertainty)
+
+### Context
+User: TAP gives far fewer features than SIFT, especially on buildings and
+windows. Asked (1) which parameters / sampling methods give more features,
+(2) a tracking mode switch: sift | tapnet | both. Likes that TAP covers
+sky / weak-texture regions.
+
+### Work Done
+1. **Funnel measurement** (Great Wall, per image): SIFT 1585 candidates ->
+   1469 verified -> 1243 triangulated; TAP 428 -> 426 -> 412. TAP loses
+   almost nothing after tracking: the gap is entirely query placement.
+2. **Texture-stratified density** (3D-point observations per grid cell by
+   Shi-Tomasi tercile): SIFT 0.25 / 2.26 / 8.60 (34x high/low), TAP
+   0.89 / 1.37 / 1.39 (1.6x). Root cause: one query per grid cell by design.
+3. **Adaptive sampling** (`queries.py`): per-cell quota counting live
+   tracks; coverage pass (every cell, any texture) then texture pass (up to
+   `max_queries_per_cell` corners >= `texture_threshold` x 95th-pct score);
+   `query_detector` shi_tomasi | sift; raster NMS keeps `min_distance` from
+   live tracks. Found and fixed while testing: the detector's candidate cap
+   was filled by strong corners image-wide, starving weak cells; and the
+   global quality floor (1e-3 of max) skipped 10 %-contrast texture ->
+   `min_corner_quality` 1e-4 (Great Wall cell coverage 315 -> 336/336).
+4. **Hybrid mode** (`sift.py`, `database.py`): COLMAP's own SIFT extraction
+   + sequential matching into a temp DB, merged with TAP keypoints (SIFT
+   keypoints keep their affine shape, TAP gets identity) and jointly verified
+   per pair. Unit test caught passing Nx6 keypoints to verification.
+5. **Bug found (mine, from the first round):** my emulation of COLMAP's
+   sequential pairing took linear offsets 1..overlap UNION quadratic
+   offsets; COLMAP's `quadratic_overlap` uses only 1, 2, 4, ... 2^(overlap-1)
+   (src/colmap/controllers/pairing.cc). COLTAP had verified ~2x more pairs
+   (1081 vs 545 on Great Wall), so the README claim "identical image pairs"
+   was false. Fixed; the static score still votes over the denser union
+   (more votes separate moving points better: 15-24 of 80 moving tracks
+   survive depending on pair density), but the database gets exactly
+   COLMAP's schedule. All COLTAP workspaces re-exported from saved tracks.
+
+### Hypotheses tested for "adaptive TAP-only has worse rotation on GT"
+Synthetic GT: adaptive 2D median error 0.33 px (better than uniform 0.40),
+but RRE 0.081 deg vs 0.019 deg. Mapper seed spread < 0.002 deg -> systematic.
+- Occlusion corners (T-junctions): 71-77 % of bad tracks lie on depth edges
+  in both configs, but GT-oracle removal only moves adaptive 0.081 -> 0.063
+  (uniform gets slightly worse). Minor contributor, not the cause.
+- Correlated errors between neighbouring queries: residual cosine
+  similarity within 25 px is 0.29 (uniform) vs 0.26 (adaptive). Not it.
+- Gross-error tail: >3 px 0.77 % vs 0.70 %. Not it.
+- Lens distortion k1 (error grows at both ends of the sequence = bend):
+  k1 -0.0007 vs -0.0002, focal 501.1 vs 499.6. Not it.
+- Open. Absolute size is small (0.08 deg); hybrid on uniform TAP is the
+  most accurate configuration (0.013 deg vs SIFT 0.024 deg).
+
+### Decisions
+- Default TAP sampling stays uniform (accuracy first); adaptive is opt-in
+  (`--TapTracker.max_queries_per_cell 4`), default per-instance cap raised
+  800 -> 2000 so that one flag is enough.
+- Hybrid = uniform TAP + COLMAP SIFT.
+- Sky: tracks at infinity cannot be triangulated (COLMAP's min
+  triangulation angle) and drifting clouds are not static, so sky tracks
+  add no 3D structure; the useful part of TAP's coverage is weak-texture
+  *surfaces* (haze-covered terrain, walls, ground).
+
+### Root Cause / Outcome
+- Fewer TAP features = query placement (1 per grid cell), not tracking loss.
+- Adaptive sampling (`max_queries_per_cell 4`): 2.3-2.9x density, mostly on
+  textured cells (Great Wall high-texture 1.36 -> 3.85 obs/cell, Colosseum
+  1.25 -> 3.64), longer tracks, no slower (fewer instances); TAP-only pose
+  accuracy on GT worse (open question above).
+- Hybrid (uniform TAP + COLMAP SIFT): most accurate on GT (RRE 0.013 deg vs
+  SIFT 0.024, TAP 0.019; ATE 0.030 % vs 0.043 / 0.060), SIFT-level density
+  on texture plus TAP coverage, and fixes the fox case (RRE 0.28 deg vs TAP
+  0.70, SIFT 0.29).
+
+### Checklist
+- [x] 18 unit tests + 2 end-to-end tests (tapnext, hybrid via the CLI) pass
+- [x] CI ruff 0.15.20 format/check clean
+- [x] All COLTAP workspaces re-exported with COLMAP's exact pair schedule
+- [ ] Root cause of the adaptive-sampling rotation regression (open)
+- [ ] GPU timing, 512 px checkpoint (no GPU here)
