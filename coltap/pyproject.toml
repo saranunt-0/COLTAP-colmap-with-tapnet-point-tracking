@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coltap"
+version = "0.1.0"
+description = "COLMAP with TAPNext++ point tracking for ordered image sequences"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause (vendored TAPNext code: Apache-2.0)" }
+dependencies = [
+    "pycolmap>=4.2",
+    "torch>=2.4",
+    "torchvision>=0.19",
+    "einops",
+    "numpy",
+    "opencv-python-headless",
+    "imageio",
+]
+
+[project.optional-dependencies]
+viz = ["imageio-ffmpeg", "matplotlib"]
+test = ["pytest>=8"]
+
+[project.scripts]
+coltap = "coltap.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["coltap*"]
+
+[tool.setuptools.package-data]
+"coltap.third_party.tapnext" = ["LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "-q"]

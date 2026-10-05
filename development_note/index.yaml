@@ -1,0 +1,10 @@
+# development_note/index.yaml
+last_updated: "2026-10-05"
+modules:
+  - name: coltap
+    path: modules/coltap/timeline.md
+    description: "TAPNext++ point tracking as drop-in COLMAP correspondence search; selection weights; benchmarks"
+standalone:
+  - name: architecture
+    path: architecture.md
+    description: "Where COLTAP plugs into COLMAP, package layout, key design decisions"
