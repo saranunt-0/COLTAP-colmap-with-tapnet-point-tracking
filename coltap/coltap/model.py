@@ -109,6 +109,52 @@ class StepOutput:
     xy: np.ndarray  # [Q, 2] float32, (x, y) in [0, MODEL_COORD_SIZE]
     visibility: np.ndarray  # [Q] float32 in [0, 1], sigmoid(visible_logit)
     certainty: np.ndarray  # [Q] float32 in [0, 1], mass within radius
+    # Spread of the coordinate heatmap, [Q, 2] (sigma_x, sigma_y) in model
+    # coordinates (see heatmap_sigma). None for trackers without heatmaps.
+    sigma_local: np.ndarray | None = None
+    sigma_global: np.ndarray | None = None
+
+
+def heatmap_sigma(
+    track_logits: torch.Tensor, tracks_yx: torch.Tensor, window: int = 20
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-axis standard deviation of TAPNext's coordinate distribution.
+
+    TAPNext's coordinate head is trained with a softmax cross-entropy over
+    256 position bins per axis, so softmax(logits) is a predicted marginal
+    distribution of the point's position. Returns (local, global) sigmas as
+    [..., 2] tensors in (x, y) order and model coordinates:
+
+    * local: spread within +-``window`` bins of the mode, i.e. around the
+      estimate that the soft-argmax actually returns;
+    * global: spread of the whole distribution around the estimate, which
+      also grows when the model hesitates between distant locations.
+    """
+    logits = track_logits.float()
+    n_bins = logits.shape[-1] // 2
+    centers = torch.arange(n_bins, device=logits.device, dtype=torch.float32)
+    centers = centers + 0.5
+    sig_local, sig_global = [], []
+    # First half of the logits is y, second half x (as in tracker_certainty).
+    for axis, axis_logits in enumerate(logits.split(n_bins, dim=-1)):
+        prob = torch.softmax(axis_logits, dim=-1)
+        estimate = tracks_yx[..., axis : axis + 1].float()
+        sig_global.append(
+            ((prob * (centers - estimate) ** 2).sum(-1)).clamp_min(1e-6).sqrt()
+        )
+        mode = prob.argmax(dim=-1, keepdim=True).float()
+        inside = ((centers - mode).abs() <= window).float()
+        local = prob * inside
+        local = local / local.sum(-1, keepdim=True).clamp_min(1e-12)
+        mean = (local * centers).sum(-1, keepdim=True)
+        sig_local.append(
+            ((local * (centers - mean) ** 2).sum(-1)).clamp_min(1e-6).sqrt()
+        )
+    # Stack as (x, y): index 1 is x, index 0 is y.
+    return (
+        torch.stack([sig_local[1], sig_local[0]], dim=-1),
+        torch.stack([sig_global[1], sig_global[0]], dim=-1),
+    )
 
 
 class TapNextPP:
@@ -190,6 +236,7 @@ class TapNextPP:
         certainty = tracker_certainty(
             tracks_yx, track_logits.float(), self.certainty_radius
         )
+        sigma_local, sigma_global = heatmap_sigma(track_logits, tracks_yx)
         xy = tracks_yx[0, 0].cpu().numpy()[:, ::-1]
         out = StepOutput(
             xy=np.ascontiguousarray(xy, dtype=np.float32),
@@ -197,6 +244,8 @@ class TapNextPP:
             .cpu()
             .numpy(),
             certainty=certainty[0, 0, :, 0].cpu().numpy(),
+            sigma_local=sigma_local[0, 0].cpu().numpy(),
+            sigma_global=sigma_global[0, 0].cpu().numpy(),
         )
         return out, state
 

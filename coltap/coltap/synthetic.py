@@ -103,6 +103,10 @@ class Scene:
         self.face_texture = rng.integers(0, len(textures), num_faces)
         self.face_offset = rng.random((num_faces, 2)) * 1000.0
         self.face_shade = rng.uniform(0.75, 1.0, num_faces)
+        # Per-face texture scale; callers may overwrite entries (and
+        # face_texture / face_shade) to design a scene. Face id of box b:
+        # 6 * b + 2 * axis + side.
+        self.face_texels_per_unit = np.full(num_faces, float(texels_per_unit))
 
     def raycast(self, origins: np.ndarray, dirs: np.ndarray):
         """Nearest hit per ray. Returns (distance, face_id, hit_points)."""
@@ -144,7 +148,7 @@ class Scene:
             sel = faces == face
             axis = (face % 6) // 2
             uv_axes = [a for a in range(3) if a != axis]
-            uv = points[sel][:, uv_axes] * self.texels_per_unit
+            uv = points[sel][:, uv_axes] * self.face_texels_per_unit[face]
             uv = uv + self.face_offset[face]
             tex = self.textures[self.face_texture[face]]
             mapx = np.mod(uv[:, 0], tex.shape[1]).astype(np.float32)
