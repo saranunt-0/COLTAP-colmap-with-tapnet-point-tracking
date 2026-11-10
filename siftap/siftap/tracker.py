@@ -32,6 +32,16 @@ class TrackerOptions:
     keyframe_interval: int = 10
     keyframe_max_sigma: float = 1.0
     keyframe_min_inlier_fraction: float = 0.5
+    # What to report while the target is hidden (TAPNext++ occlusion head)
+    # or uncertain. confidence = P(|error| <= tolerance px).
+    # * "predict": hidden frames report TAPNext++'s trajectory through the
+    #   occlusion when confidence >= min_confidence, else they are dropped.
+    # * "drop": hidden frames, and any frame with confidence <
+    #   min_confidence, are dropped; reporting resumes when the target
+    #   reappears.
+    occlusion: str = "predict"
+    min_confidence: float = 0.5
+    tolerance: float = 4.0
 
 
 @dataclasses.dataclass
@@ -44,6 +54,30 @@ class FrameRecord:
     # Similarity (a, b, tx, ty) mapping first-frame offsets around the target
     # to this frame, centred on the fused position (for drawing areas).
     transform: np.ndarray | None
+    # "tracked" (visible), "predicted" (hidden, position from the
+    # trajectory) or "dropped" (no position reported for this frame).
+    status: str = "tracked"
+    confidence: float = 1.0  # P(|error| <= tolerance)
+    hidden: bool = False  # TAPNext++ reports the target occluded
+
+    @property
+    def reported(self) -> bool:
+        return self.status != "dropped"
+
+
+def frame_status(
+    hidden: bool, confidence: float, policy: str, min_confidence: float
+) -> str:
+    """Report policy for one frame (see TrackerOptions.occlusion)."""
+    if policy == "predict":
+        if not hidden:
+            return "tracked"
+        return "predicted" if confidence >= min_confidence else "dropped"
+    if policy == "drop":
+        if hidden or confidence < min_confidence:
+            return "dropped"
+        return "tracked"
+    raise ValueError(f"Unknown occlusion policy {policy!r}")
 
 
 class SiftapTracker:
@@ -128,12 +162,36 @@ class SiftapTracker:
                 sift_meas = self.sift[k].measure(
                     gray, prior, min(prior_sigma, max(gray.shape))
                 )
-            fused = fusion.update([tap_meas[k], sift_meas])
-            transform = _region_transform(tap_meas[k], sift_meas, fused)
-            self.records[k].append(
-                FrameRecord(t, prior, tap_meas[k], sift_meas, fused, transform)
+            tap_k = tap_meas[k]
+            # TAPNext++'s occlusion head flags 95-98 % of hidden frames
+            # (benchmark); SIFT "matches" accepted while it says hidden
+            # were on the occluder in 15/17 (predict) and 59/61 (drop)
+            # cases, so SIFT is not used then. Both
+            # policies run the same filter (fed with TAPNext++'s estimate
+            # through the occlusion) and differ only in what they report.
+            hidden = tap_k is not None and tap_k.occluded
+            fused = fusion.update([tap_k, None if hidden else sift_meas])
+            if hidden and sift_meas is not None:
+                fused.accepted["sift"] = False
+            confidence = fused.confidence(opts.tolerance)
+            status = frame_status(
+                hidden, confidence, opts.occlusion, opts.min_confidence
             )
-            if opts.use_sift:
+            transform = _region_transform(tap_k, sift_meas, fused)
+            self.records[k].append(
+                FrameRecord(
+                    t,
+                    prior,
+                    tap_k,
+                    sift_meas,
+                    fused,
+                    transform,
+                    status,
+                    confidence,
+                    hidden,
+                )
+            )
+            if opts.use_sift and status == "tracked":
                 self._maybe_keyframe(k, t, gray, sift_meas, fused, transform)
 
     def _fusion_kwargs(self):

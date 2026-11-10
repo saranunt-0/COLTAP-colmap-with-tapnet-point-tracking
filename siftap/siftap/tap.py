@@ -56,6 +56,12 @@ class TapCalibration:
     # texture_sigma (see texture_sigma). Fitted in benchmark/evaluate.py.
     drift_scale: float = 10.91
     texture_half: int = 12  # half-size of the texture window (px)
+    # While the target is hidden, TAPNext++ still estimates where it is
+    # (median error 2-4 px in the benchmark, growing with the occlusion);
+    # std = occluded_scale * global heatmap sigma (+ floor), fitted on the
+    # occluded frames of the calibration sequences.
+    occluded_scale: float = 0.513
+    occluded_floor: float = 0.0
 
 
 @dataclasses.dataclass
@@ -149,7 +155,8 @@ def add_texture_drift(meas, gray, calib: TapCalibration) -> None:
             continue
         sigma = min(next(tex), 1e3)
         m.info["texture_sigma"] = float(sigma)
-        m.drift_sigma = calib.drift_scale * sigma
+        if not m.occluded:  # an occluded point's patch shows the occluder
+            m.drift_sigma = calib.drift_scale * sigma
 
 
 def point_sigma(raw: TapRaw, sel, calib: TapCalibration) -> np.ndarray:
@@ -170,8 +177,16 @@ def tap_measurement(
     offsets: np.ndarray,
     target: Target,
     calib: TapCalibration,
-) -> Measurement | None:
-    """One target's TAPNext++ measurement, or None if it is occluded."""
+) -> Measurement:
+    """One target's TAPNext++ measurement.
+
+    Visible target: the target point's estimate (point targets) or a fit
+    over the visible points (areas, ``point_mode="fit"``). Hidden target:
+    TAPNext++'s own estimate of the hidden position, flagged ``occluded``,
+    with the larger occlusion uncertainty. (Fitting the visible support
+    points instead was 4x worse in the benchmark: they sit next to the
+    occluder.)
+    """
     xy = raw.xy[sel]
     vis = raw.visibility[sel]
     sig = point_sigma(raw, sel, calib)
@@ -181,8 +196,8 @@ def tap_measurement(
         "center_sigma": float(np.max(sig[0])),
         "visible_points": int(visible.sum()),
     }
-    if not target.is_area and calib.point_mode == "direct" and visible[0]:
-        cov = np.diag(sig[0] ** 2)
+    fit = None
+    if visible.sum() >= 1:
         fit = fit_similarity(
             offsets[visible],
             xy[visible],
@@ -190,26 +205,41 @@ def tap_measurement(
             "tap",
             correlation=calib.correlation,
         )
+    point_direct = not target.is_area and calib.point_mode == "direct"
+    use_fit = not point_direct and fit is not None and visible.sum() >= 3
+    if use_fit:
+        fit.info.update(info)
+        fit.drifts = True
+        return fit
+    if not target.is_area and visible[0]:
+        # Visible point ("direct", or "fit" with too few support points).
         return Measurement(
             position=xy[0].astype(float),
-            cov=cov,
+            cov=np.diag(sig[0] ** 2),
             source="tap",
             transform=None if fit is None else _recenter(fit, xy[0]),
             num_points=1,
             info=info,
+            drifts=True,
         )
-    if visible.sum() < (1 if visible[0] else 3):
-        return None
-    fit = fit_similarity(
-        offsets[visible],
-        xy[visible],
-        sig[visible],
-        "tap",
-        correlation=calib.correlation,
+    # Hidden: TAPNext++'s estimate of the occluded position.
+    occ = calib.occluded_scale * raw.sigma_global[sel]
+    occ = np.sqrt(occ**2 + calib.occluded_floor**2)
+    position, cov = xy[0].astype(float), np.diag(occ[0] ** 2)
+    if target.is_area:
+        whole = fit_similarity(offsets, xy, occ, "tap")
+        if whole is not None:
+            position, cov = whole.position, whole.cov
+    return Measurement(
+        position=position,
+        cov=cov,
+        source="tap",
+        transform=None if fit is None else _recenter(fit, position),
+        num_points=int(visible.sum()),
+        info=info,
+        drifts=True,
+        occluded=True,
     )
-    if fit is not None:
-        fit.info.update(info)
-    return fit
 
 
 def _recenter(fit: Measurement, center: np.ndarray):

@@ -142,7 +142,11 @@ def test_inlier_posterior_uses_agreement_and_prior():
 
 def _tap(xy, sigma=1.0, drift=0.3):
     return Measurement(
-        np.array(xy, float), sigma**2 * np.eye(2), "tap", drift_sigma=drift
+        np.array(xy, float),
+        sigma**2 * np.eye(2),
+        "tap",
+        drifts=True,
+        drift_sigma=drift,
     )
 
 
@@ -226,3 +230,42 @@ def test_selection_click_drag_undo_and_scaling():
     half = area.scaled(0.5)
     np.testing.assert_allclose(half.box, area.box * 0.5)
     np.testing.assert_allclose(half.center, area.center * 0.5)
+
+
+def test_frame_status_policies():
+    from siftap.tracker import frame_status
+
+    # predict: visible frames are always reported; hidden ones need x.
+    assert frame_status(False, 0.1, "predict", 0.5) == "tracked"
+    assert frame_status(True, 0.8, "predict", 0.5) == "predicted"
+    assert frame_status(True, 0.3, "predict", 0.5) == "dropped"
+    # drop: hidden frames and low-confidence frames are dropped.
+    assert frame_status(True, 0.99, "drop", 0.5) == "dropped"
+    assert frame_status(False, 0.3, "drop", 0.5) == "dropped"
+    assert frame_status(False, 0.8, "drop", 0.5) == "tracked"
+    with pytest.raises(ValueError):
+        frame_status(False, 1.0, "guess", 0.5)
+
+
+def test_confidence_is_probability_within_tolerance():
+    from siftap.geometry import mixture_cdf
+
+    est = Measurement(np.zeros(2), np.eye(2), "tap")  # sigma 1 px
+    # 2D Gaussian: P(r <= 2 sigma) = 1 - exp(-2) = 0.865
+    assert abs(est.confidence(2.0) - (1 - np.exp(-2))) < 1e-9
+    assert est.confidence(10.0) > 0.999
+    # A possible mismatch caps the confidence at 1 - P(mismatch).
+    assert mixture_cdf(10.0, 1.0, 0.3, 40.0) < 0.75
+
+
+def test_hidden_tap_does_not_teach_drift_rate():
+    f = KalmanFusion(accel_sigma=0.1)
+    f.reset(np.zeros(2), 0.01 * np.eye(2), velocity=np.zeros(2))
+    f.predict()
+    f.update([_tap([0.0, 0.0], drift=0.3)])
+    assert f.drift_sigma == 0.3
+    hidden = _tap([0.0, 0.0], sigma=3.0, drift=50.0)
+    hidden.occluded = True
+    f.predict()
+    f.update([hidden])
+    assert f.drift_sigma == 0.3  # the occluder's texture is ignored

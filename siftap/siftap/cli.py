@@ -69,12 +69,16 @@ def records_to_json(records, targets, names, scale=1.0, start=0, stride=1):
     for k, recs in enumerate(records):
         rows = []
         for r in recs:
-            lost = r.fused.lost
+            # Dropped frames report no position (the filter's internal
+            # guess is not an observation).
+            gone = r.fused.lost or not r.reported
             row = {
                 "frame": r.frame,
                 "video_frame": start + r.frame * stride,
-                "fused": None if lost else xy(r.fused.position),
-                "fused_r95": None if lost else r.fused.radius() / scale,
+                "status": r.status,
+                "confidence": float(r.confidence),
+                "fused": None if gone else xy(r.fused.position),
+                "fused_r95": None if gone else r.fused.radius() / scale,
             }
             for m in (r.sift, r.tap):
                 if m is None:
@@ -86,6 +90,8 @@ def records_to_json(records, targets, names, scale=1.0, start=0, stride=1):
                 row[f"{m.source}_accepted"] = bool(
                     r.fused.accepted.get(m.source, False)
                 )
+                if m.occluded:
+                    row[f"{m.source}_occluded"] = True
             rows.append(row)
         t = targets[k]
         out.append(
@@ -129,6 +135,26 @@ def cmd_track(argv):
     p.add_argument(
         "--accel_sigma", type=float, default=TrackerOptions.accel_sigma
     )
+    p.add_argument(
+        "--occlusion",
+        default="predict",
+        choices=("predict", "drop"),
+        help="hidden target: 'predict' reports TAPNext++'s trajectory while "
+        "confidence >= --min_confidence; 'drop' reports nothing while hidden "
+        "or below --min_confidence and resumes when it reappears",
+    )
+    p.add_argument(
+        "--min_confidence",
+        type=float,
+        default=50.0,
+        help="percent; confidence = P(position within --tolerance px)",
+    )
+    p.add_argument(
+        "--tolerance",
+        type=float,
+        default=4.0,
+        help="video pixels, for the confidence",
+    )
     p.add_argument("--no_sift", action="store_true")
     p.add_argument("--no_tap", action="store_true")
     p.add_argument("--stride", type=int, default=1)
@@ -140,6 +166,27 @@ def cmd_track(argv):
     p.add_argument("--output", default="", help=".mp4 or .gif")
     p.add_argument("--output_width", type=int, default=0)
     p.add_argument("--json", default="")
+    p.add_argument(
+        "--focus",
+        action="append",
+        default=[],
+        help="add a stabilized view of this target (name, 1-based index or "
+        "'all'; repeatable): the tracked point stays fixed, so popping or "
+        "jitter shows as motion; the residual jitter is measured",
+    )
+    p.add_argument(
+        "--focus_size",
+        type=float,
+        default=40.0,
+        help="half-size of the stabilized window (video pixels)",
+    )
+    p.add_argument(
+        "--focus_mode",
+        default="auto",
+        choices=("auto", "translate", "similarity"),
+        help="remove translation only, or also the tracked rotation/scale "
+        "(auto: similarity for areas, translation for points)",
+    )
     p.add_argument(
         "--tap_cache",
         default="",
@@ -193,6 +240,9 @@ def cmd_track(argv):
         accel_sigma=args.accel_sigma,
         use_tap=not args.no_tap,
         use_sift=not args.no_sift,
+        occlusion=args.occlusion,
+        min_confidence=args.min_confidence / 100.0,
+        tolerance=args.tolerance * scale,
     )
     tracker = SiftapTracker(
         targets, model, options, TapCalibration(), SiftParams()
@@ -202,7 +252,16 @@ def cmd_track(argv):
         with open(args.tap_cache, "wb") as f:
             pickle.dump({"key": cache_key, "raw": tracker.tap_raw}, f)
     for k, recs in enumerate(records):
-        radii = [r.fused.radius() for r in recs[1:] if not r.fused.lost]
+        radii = [r.fused.radius() for r in recs[1:] if r.reported]
+        counts = {
+            st: sum(r.status == st for r in recs)
+            for st in ("predicted", "dropped")
+        }
+        LOGGER.info(
+            "%s: %d predicted (hidden), %d dropped frames",
+            names[k],
+            *counts.values(),
+        )
         LOGGER.info(
             "%s: median 95%% radius %.2f px, lost in %d/%d frames",
             names[k],
@@ -210,25 +269,76 @@ def cmd_track(argv):
             sum(r.fused.lost for r in recs),
             len(recs),
         )
-    if args.json:
-        Path(args.json).write_text(
-            json.dumps(
-                records_to_json(
-                    records, targets, names, scale, args.start, args.stride
-                ),
-                indent=1,
+    focus = focus_indices(args.focus, names)
+    half = args.focus_size * scale
+    jitter = {}
+    if focus:
+        from .focus import jitter_summary
+
+        jitter = jitter_summary(
+            frames, records, targets, names, focus, half, args.focus_mode
+        )
+        for name, j in jitter.items():
+            LOGGER.info(
+                "%s: residual jitter median %s px, p95 %s px (%d frames)",
+                name,
+                _fmt(j["median_px"], scale),
+                _fmt(j["p95_px"], scale),
+                j["measured_frames"],
             )
+    if args.json:
+        tracks = records_to_json(
+            records, targets, names, scale, args.start, args.stride
         )
+        for track in tracks:
+            j = jitter.get(track["name"])
+            if j is not None:
+                track["jitter_px"] = {
+                    k: (None if v is None else v / scale)
+                    if k != "measured_frames"
+                    else v
+                    for k, v in j.items()
+                }
+        Path(args.json).write_text(json.dumps(tracks, indent=1))
     if args.output:
-        write_video(
-            render_frames(
-                frames, records, targets, names, width=args.output_width
-            ),
-            args.output,
-            fps=min(fps, 15.0),
+        video = render_frames(
+            frames, records, targets, names, width=args.output_width
         )
+        if focus:
+            from .focus import render_focus
+
+            video = render_focus(
+                video,
+                frames,
+                records,
+                targets,
+                names,
+                focus,
+                half,
+                args.focus_mode,
+            )
+        write_video(video, args.output, fps=min(fps, 15.0))
         LOGGER.info("wrote %s", args.output)
     return 0
+
+
+def _fmt(value, scale):
+    return "n/a" if value is None else f"{value / scale:.2f}"
+
+
+def focus_indices(requested, names):
+    """--focus values (names, 1-based indices or "all") -> target indices."""
+    out = []
+    for item in requested:
+        if item == "all":
+            return list(range(len(names)))
+        if item in names:
+            out.append(names.index(item))
+        elif item.isdigit() and 1 <= int(item) <= len(names):
+            out.append(int(item) - 1)
+        else:
+            raise SystemExit(f"--focus {item!r}: no such target ({names})")
+    return list(dict.fromkeys(out))
 
 
 def main(argv=None):

@@ -45,6 +45,7 @@ from .geometry import (
     Measurement,
     inlier_posterior,
     mahalanobis2,
+    mixture_cdf,
     mixture_radius,
 )
 
@@ -70,6 +71,15 @@ class FusedEstimate:
     def radius(self, level: float = 0.95) -> float:
         return mixture_radius(
             self.sigma, self.p_outlier, self.outlier_sigma, level
+        )
+
+    def confidence(self, tolerance: float) -> float:
+        """P(|error| <= tolerance): how likely the estimate is within
+        ``tolerance`` px of the truth (0 when lost)."""
+        if self.lost:
+            return 0.0
+        return mixture_cdf(
+            tolerance, self.sigma, self.p_outlier, self.outlier_sigma
         )
 
     @property
@@ -249,7 +259,7 @@ class KalmanFusion(Fusion):
     def _H(self, m: Measurement) -> np.ndarray:
         H = np.zeros((2, self.dim))
         H[0, 0] = H[1, 1] = 1.0
-        if self.drift and m.drift_sigma > 0:
+        if self.drift and m.drifts:
             H[0, 4] = H[1, 5] = 1.0
         return H
 
@@ -297,8 +307,10 @@ class KalmanFusion(Fusion):
                 )
             ]
         for m in meas:
-            if m.drift_sigma > 0:
-                self.drift_sigma = m.drift_sigma  # used by the next predict
+            if m.drifts and not m.occluded:
+                # Texture under an occluded point is the occluder's: keep
+                # the last rate. Used by the next predict.
+                self.drift_sigma = m.drift_sigma
         # Most reliable first: it best constrains the gate for the others.
         meas.sort(key=lambda m: np.trace(m.moment_cov()))
         for m in meas:
@@ -317,7 +329,7 @@ class KalmanFusion(Fusion):
             # uncertainty.
             fixed = []
             for m in meas:
-                if self.drift and m.drift_sigma > 0:
+                if self.drift and m.drifts:
                     m = dataclasses.replace(
                         m,
                         position=m.position - self.x[4:],

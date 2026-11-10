@@ -25,6 +25,12 @@ TAP_COLOR = (255, 150, 40)
 FUSED_COLOR = (70, 230, 100)
 REJECT_COLOR = (255, 60, 60)
 TRUTH_COLOR = (255, 255, 255)
+DROPPED_COLOR = (150, 150, 150)
+STATUS_COLORS = {
+    "tracked": FUSED_COLOR,
+    "predicted": TAP_COLOR,
+    "dropped": DROPPED_COLOR,
+}
 SQRT_CHI2 = float(np.sqrt(CHI2_2DOF_95))
 _SHIFT = 4
 _ONE = 1 << _SHIFT
@@ -83,6 +89,16 @@ def draw_target(
 ):
     """Draw one target's sources, fusion and trail onto ``canvas``."""
     max_r = 2.0 * max(canvas.shape[:2])
+    if rec.status == "dropped":
+        # Nothing is reported for this frame: a faint note where the
+        # target was last reported.
+        where = history[-1] if history else rec.fused.position
+        org = (
+            int(np.clip(where[0] * scale, 6, canvas.shape[1] - 120)),
+            int(np.clip(where[1] * scale, 18, canvas.shape[0] - 24)),
+        )
+        _text(canvas, f"{name}: hidden", org, 0.4, DROPPED_COLOR)
+        return
     for meas, color in ((rec.sift, SIFT_COLOR), (rec.tap, TAP_COLOR)):
         if meas is None:
             continue
@@ -153,12 +169,28 @@ def draw_target(
         return
     p = _pt(fused.position, scale)
     r = min(r_px, max_r)
-    cv2.circle(
-        overlay, p, int(round(r * _ONE)), FUSED_COLOR, -1, cv2.LINE_AA, _SHIFT
-    )
-    cv2.circle(
-        canvas, p, int(round(r * _ONE)), FUSED_COLOR, 2, cv2.LINE_AA, _SHIFT
-    )
+    if rec.status == "predicted":
+        # Hidden target, position from the trajectory: dashed, no fill.
+        dashed_circle(canvas, p, r, FUSED_COLOR, 2, dash_deg=10)
+    else:
+        cv2.circle(
+            overlay,
+            p,
+            int(round(r * _ONE)),
+            FUSED_COLOR,
+            -1,
+            cv2.LINE_AA,
+            _SHIFT,
+        )
+        cv2.circle(
+            canvas,
+            p,
+            int(round(r * _ONE)),
+            FUSED_COLOR,
+            2,
+            cv2.LINE_AA,
+            _SHIFT,
+        )
     d = 5 * _ONE
     white = (255, 255, 255)
     cv2.line(
@@ -182,7 +214,10 @@ def draw_target(
     if corners is not None:
         poly = np.array([_pt(c, scale) for c in corners], np.int32)
         cv2.polylines(canvas, [poly], True, FUSED_COLOR, 2, cv2.LINE_AA, _SHIFT)
-    label = f"{name} +/-{fused.radius():.1f}px"
+    state = " occluded" if rec.status == "predicted" else ""
+    label = (
+        f"{name}{state} +/-{fused.radius():.1f}px {100 * rec.confidence:.0f}%"
+    )
     lx = int(x + r + 6)
     ly = int(y - 6)
     _text(canvas, label, (min(lx, width - 120), max(ly, 14)), 0.42)
@@ -214,7 +249,7 @@ def _timeline(
         for getter, color in (
             (lambda r: r.sift, SIFT_COLOR),
             (lambda r: r.tap, TAP_COLOR),
-            (lambda r: r.fused, FUSED_COLOR),
+            (lambda r: r.fused if r.reported else None, FUSED_COLOR),
         ):
             pts = []
             for i, rec in enumerate(recs[: t + 1]):
@@ -243,34 +278,43 @@ def _timeline(
                 if np.isfinite(e):
                     x = label_w + int(i / max(n - 1, 1) * plot_w)
                     cv2.circle(row, (x, int(ypos(e))), 1, TRUTH_COLOR, -1)
+        # Status strip: green tracked, orange predicted (hidden), grey dropped.
+        for i, rec in enumerate(recs[: t + 1]):
+            x0 = label_w + int(i / max(n - 1, 1) * plot_w)
+            x1 = label_w + int((i + 1) / max(n - 1, 1) * plot_w)
+            color = STATUS_COLORS.get(rec.status, DROPPED_COLOR)
+            cv2.rectangle(
+                row, (x0, row_h - 3), (max(x1 - 1, x0), row_h - 1), color, -1
+            )
         x = label_w + int(t / max(n - 1, 1) * plot_w)
         cv2.line(row, (x, 2), (x, row_h - 2), (200, 200, 200), 1)
         rows.append(row)
     return np.concatenate(rows, 0)
 
 
-def _legend(width, truth=False):
+def _legend(width, truth=False, statuses=()):
     bar = np.full((26, width, 3), 22, np.uint8)
     x = 8
     items = [
         ("SIFT", SIFT_COLOR),
         ("TAPNext++", TAP_COLOR),
-        ("fused (Kalman)", FUSED_COLOR),
-        ("rejected by gate", REJECT_COLOR),
+        ("fused", FUSED_COLOR),
+        ("rejected", REJECT_COLOR),
     ]
+    if "predicted" in statuses:
+        items.append(("predicted (hidden)", FUSED_COLOR))
+    if "dropped" in statuses:
+        items.append(("dropped", DROPPED_COLOR))
     if truth:
         items.append(("truth", TRUTH_COLOR))
     for text, color in items:
         cv2.circle(bar, (x + 5, 13), 5, color, -1, cv2.LINE_AA)
         _text(bar, text, (x + 14, 18), 0.42, (235, 235, 235))
         x += 30 + 8 * len(text)
-    _text(
-        bar,
-        "circles: 95% radius",
-        (max(x, width - 150), 18),
-        0.4,
-        (180, 180, 180),
-    )
+    if x < width - 150:
+        _text(
+            bar, "circles: 95% radius", (width - 150, 18), 0.4, (180, 180, 180)
+        )
     return bar
 
 
@@ -280,7 +324,7 @@ def _history_and_corners(target, recs, t, trail, max_radius=np.inf):
     hist = [
         r.fused.position
         for r in recs[max(0, t - trail) : t + 1]
-        if not r.fused.lost and r.fused.radius() <= max_radius
+        if r.reported and not r.fused.lost and r.fused.radius() <= max_radius
     ]
     corners = None
     if target.is_area and rec.transform is not None:
@@ -307,6 +351,7 @@ def render_frames(
     position (white ring) and the fused error in the timelines.
     """
     names = names or [t.name or f"T{k + 1}" for k, t in enumerate(targets)]
+    statuses = {r.status for recs in records for r in recs}
     errors = None
     if truth is not None:
         vis = (
@@ -317,7 +362,7 @@ def render_frames(
         errors = np.full((len(targets), len(images)), np.nan)
         for k, recs in enumerate(records):
             for i, r in enumerate(recs):
-                if vis[i, k] and not r.fused.lost:
+                if vis[i, k] and r.reported and not r.fused.lost:
                     errors[k, i] = np.linalg.norm(
                         r.fused.position - truth[i, k]
                     )
@@ -358,7 +403,7 @@ def render_frames(
                         canvas, p, 3 * _ONE, TRUTH_COLOR, 1, cv2.LINE_AA, _SHIFT
                     )
         _text(canvas, f"frame {t}", (8, canvas.shape[0] - 8), 0.42)
-        parts = [_legend(canvas.shape[1], truth is not None), canvas]
+        parts = [_legend(canvas.shape[1], truth is not None, statuses), canvas]
         if timeline:
             parts.append(
                 _timeline(canvas.shape[1], records, t, names, errors=errors)

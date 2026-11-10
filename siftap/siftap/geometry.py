@@ -40,9 +40,13 @@ class Measurement:
     # (core) covariance.
     p_outlier: float = 0.0
     outlier_sigma: float = 0.0
-    # > 0 for a drifting source (TAPNext++): it measures position + drift,
-    # and the drift does a random walk with this std per frame.
+    # A drifting source (TAPNext++) measures position + drift; the drift
+    # does a random walk with std drift_sigma per frame.
+    drifts: bool = False
     drift_sigma: float = 0.0
+    # The target itself is hidden (TAPNext++ occlusion head); the position
+    # is the tracker's estimate of where it is behind the occluder.
+    occluded: bool = False
 
     @property
     def sigma(self) -> float:
@@ -54,6 +58,12 @@ class Measurement:
         under the core + outlier mixture (the "GPS" radius)."""
         return mixture_radius(
             self.sigma, self.p_outlier, self.outlier_sigma, level
+        )
+
+    def confidence(self, tolerance: float) -> float:
+        """P(|error| <= tolerance) under the core + outlier mixture."""
+        return mixture_cdf(
+            tolerance, self.sigma, self.p_outlier, self.outlier_sigma
         )
 
     def moment_cov(self) -> np.ndarray:
@@ -69,6 +79,22 @@ class Measurement:
         a, b, tx, ty = self.transform
         rot = np.array([[a, -b], [b, a]])
         return offsets @ rot.T + np.array([tx, ty])
+
+
+def mixture_cdf(
+    r: float, sigma: float, p_outlier: float = 0.0, outlier_sigma: float = 0.0
+) -> float:
+    """P(|error| <= r) for an isotropic 2D Gaussian core (std ``sigma``)
+    mixed with an outlier Gaussian (largest core std: conservative)."""
+
+    def inside(s):
+        return 1.0 - np.exp(-0.5 * (r / max(s, 1e-9)) ** 2)
+
+    if p_outlier <= 0.0 or outlier_sigma <= 0.0:
+        return float(inside(sigma))
+    return float(
+        (1 - p_outlier) * inside(sigma) + p_outlier * inside(outlier_sigma)
+    )
 
 
 def mixture_radius(
