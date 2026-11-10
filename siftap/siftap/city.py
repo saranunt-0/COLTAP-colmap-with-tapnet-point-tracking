@@ -95,9 +95,12 @@ def make_city(
     width: int = 640,
     height: int = 360,
     focal: float = 420.0,
+    pillars: int = 0,
 ) -> CityScene:
     """Street with 8 buildings in front of a sky dome (alternating window
-    facades and posters)."""
+    facades and posters). ``pillars`` thin columns close to the camera
+    sweep across the view during the lateral dolly: targets behind them
+    disappear for a few frames and reappear (occlusion tests)."""
     rng = np.random.default_rng(seed)
     half = np.array([40.0, 15.0, 40.0])  # dome; y is down, ground at +15
     ground = half[1]
@@ -112,6 +115,12 @@ def make_city(
                 (x - w / 2, ground - h, depth - d / 2),
                 (x + w / 2, ground, depth + d / 2),
             )
+        )
+    first_pillar = len(boxes) + 1  # box 0 is the dome
+    for x in np.linspace(-7.0, 7.0, pillars) + rng.uniform(-0.6, 0.6, pillars):
+        w, z = rng.uniform(0.25, 0.35), rng.uniform(1.0, 3.0)
+        boxes.append(
+            ((x - w / 2, ground - 16.0, z), (x + w / 2, ground, z + w))
         )
     textures = [
         sky_texture(seed=seed, vertical=True),
@@ -151,7 +160,12 @@ def make_city(
             # first uv axis (columns), on z-walls the second (rows).
             scene.face_texture[face] = 1 if axis == 0 else 0
             category[face] = "sky"
-    for b in range(1, len(scene.boxes)):
+    for b in range(first_pillar, len(scene.boxes)):
+        for f in range(6):
+            scene.face_texture[6 * b + f] = facade_ids[0]
+            scene.face_texels_per_unit[6 * b + f] = 60.0
+            category[6 * b + f] = "occluder"
+    for b in range(1, first_pillar):
         is_poster = bool(posters) and b % 2 == 0
         for f in range(6):
             face = 6 * b + f

@@ -85,12 +85,18 @@ frame t ──► TapFrontEnd (TAPNext++ on target + support points)
 | `siftap/tap.py` | TAPNext++ front-end, heatmap calibration, texture-driven drift (`texture_sigma`) |
 | `siftap/sift.py` | SIFT front-end: reference + adaptive keyframe, mismatch logistic model |
 | `siftap/fusion.py` | Baselines (`tap`, `sift`, `best`, `ivw`, `bayes`) and `KalmanFusion` variants |
-| `siftap/tracker.py` | Per-frame loop: predict, measure (SIFT window from the prior), fuse, keyframes |
-| `siftap/render.py` | GPS-style circles, gate marks, trails, radius timelines, truth overlay |
+| `siftap/tracker.py` | Per-frame loop: predict, measure (SIFT window from the prior), fuse, keyframes; occlusion policy (`predict` / `drop`) and per-frame status + confidence |
+| `siftap/render.py` | GPS-style circles, gate marks, trails, radius timelines with status strip, truth overlay |
+| `siftap/focus.py` | Stabilized focus panels (sub-pixel re-sampling on the fused track) and residual-jitter measurement |
 | `siftap/select.py`, `siftap/cli.py` | Interactive selection and `siftap track` |
-| `siftap/city.py`, `benchmark/evaluate.py` | Synthetic street scene with GT; calibration, comparison, demo |
+| `siftap/city.py`, `benchmark/evaluate.py` | Synthetic street scene with GT (optional near pillars for occlusion tests); calibration, comparison, occlusion evaluation, demos |
 
 Key decisions: uncertainties are calibrated on held-in synthetic sequences
 by per-cell 95 % coverage of the *drawn* circle; SIFT errors are a mixture,
 not a Gaussian; TAP errors are white noise + texture-driven drift, which
 SIFT (anchored to frame 0) makes observable.
+
+Occlusion: TAPNext++'s occlusion head decides "hidden"; while hidden, SIFT
+is ignored (it matches the occluder) and TAPNext++'s estimate of the hidden
+point is fused with its own calibrated (wider) uncertainty. The `predict` /
+`drop` policies share the filter and only change which frames are reported.

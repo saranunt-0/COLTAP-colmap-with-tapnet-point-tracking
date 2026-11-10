@@ -2,7 +2,7 @@
 """Ground-truth benchmark for SIFTAP on the synthetic street scene.
 
     python benchmark/evaluate.py --work_path WORK --poster_path DIR \
-        [--stage render|tap|calibrate|compare|demo|tables|all] \
+        [--stage render|tap|calibrate|compare|occlusion|demo|tables|all] \
         [--output_path DIR]
 
 * render: four sequences with exact GT. ``calib`` (seed 0) and ``calib2``
@@ -43,6 +43,9 @@ SEQUENCES = {
     "calib2": dict(seed=3, speed=0.18, frames=60, subframes=2),
     "test": dict(seed=1, speed=0.12, frames=60, subframes=1),
     "fast": dict(seed=2, speed=0.24, frames=48, subframes=4),
+    # Near pillars sweep across the view: targets disappear and reappear.
+    # Used only for the occlusion-policy evaluation.
+    "occl": dict(seed=4, speed=0.12, frames=60, subframes=1, pillars=6),
 }
 CALIBRATION = ("calib", "calib2")  # everything else is held out
 
@@ -63,7 +66,9 @@ def render(work: Path, posters):
         out = work / f"{name}.pkl"
         if out.exists():
             continue
-        c = city.make_city(posters, seed=cfg["seed"])
+        c = city.make_city(
+            posters, seed=cfg["seed"], pillars=cfg.get("pillars", 0)
+        )
         poses = city.street_trajectory(
             cfg["frames"],
             speed=cfg["speed"],
@@ -319,7 +324,7 @@ def tap_series(seq, raws, calib: TapCalibration):
     for t in range(1, n_t):
         gray = cv2.cvtColor(seq["frames"][t], cv2.COLOR_RGB2GRAY)
         for k, m in enumerate(front.measurements(raws[t], gray)):
-            if m is None:
+            if m is None or m.occluded:  # visible frames only
                 continue
             sigma[t, k] = m.sigma
             tex[t, k] = m.info["texture_sigma"]
@@ -330,6 +335,59 @@ def tap_series(seq, raws, calib: TapCalibration):
     cats = np.repeat(np.array(seq["categories"])[None], n_t, 0)
     ok = ~np.isnan(dist)
     return dist[ok], sigma[ok], tex[ok], cum[ok], time[ok], cats[ok]
+
+
+def occluded_series(seq, raws, calib: TapCalibration):
+    """Frames where TAPNext++ reports the target hidden and the truth is in
+    the image: error of its estimate, global heatmap sigma, normalized
+    time since the occlusion started (capped at 30 frames)."""
+    front = TapFrontEnd(None, make_targets(seq), calib)
+    gt = seq["gt_xy"]
+    height, width = seq["frames"][0].shape[:2]
+    run = np.zeros(len(seq["categories"]), int)
+    dist, sigma, since = [], [], []
+    for t in range(1, len(raws)):
+        for k, m in enumerate(front.measurements(raws[t])):
+            if not m.occluded:
+                run[k] = 0
+                continue
+            run[k] += 1
+            x, y = gt[t, k]
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+            dist.append(np.linalg.norm(m.position - gt[t, k]))
+            sigma.append(
+                float(np.max(raws[t].sigma_global[front.slices[k]][0]))
+            )
+            since.append(min(run[k] / 30, 0.99))
+    return np.array(dist), np.array(sigma), np.array(since)
+
+
+def calibrate_occluded(seqs, raws_list, held_out=()):
+    """std = scale * global heatmap sigma (+ floor) for hidden targets."""
+    raw = TapCalibration(occluded_scale=1.0, occluded_floor=0.0)
+    d, s, tm = _concat(
+        [
+            occluded_series(q, r, raw)
+            for q, r in zip(seqs, raws_list, strict=True)
+        ]
+    )
+    a, f, _ = fit_radius_model(d, s, time=tm)
+    out = {"scale": a, "floor": f}
+    for name, data in [
+        ("calib", (d, s)),
+        *[(n, occluded_series(q, r, raw)[:2]) for n, (q, r) in held_out],
+    ]:
+        dd, ss = data
+        r95 = K95 * np.sqrt((a * ss) ** 2 + f * f)
+        out[name] = {
+            "n": len(dd),
+            "median_error": float(np.median(dd)),
+            "p90_error": float(np.quantile(dd, 0.9)),
+            "circle95": float(np.mean(dd <= r95)),
+            "median_r95": float(np.median(r95)),
+        }
+    return out
 
 
 def _concat(parts):
@@ -401,6 +459,8 @@ def calibrate(work: Path):
         with open(work / f"{n}_tap.pkl", "rb") as f:
             held_out.append((n, (load(work, n), pickle.load(f))))
     report.update(calibrate_tap(seqs, raws, held_out))
+    report["tap_occluded"] = calibrate_occluded(seqs, raws, held_out)
+    LOGGER.info("tap occluded %s", report["tap_occluded"])
     (work / "calibration.json").write_text(json.dumps(report, indent=1))
     return report
 
@@ -421,11 +481,14 @@ def sift_params_from(fit: dict) -> SiftParams:
 def calibrated_params(work: Path):
     rep = json.loads((work / "calibration.json").read_text())
     tf = rep["tap_fits"][rep["tap_best"]]["drift"]
+    occ = rep.get("tap_occluded", {})
     tap = TapCalibration(
         sigma_mode=rep["tap_best"],
         sigma_scale=tf["scale"],
         sigma_floor=tf["floor"],
         drift_scale=tf["drift_scale"],
+        occluded_scale=occ.get("scale", TapCalibration.occluded_scale),
+        occluded_floor=occ.get("floor", TapCalibration.occluded_floor),
     )
     return tap, sift_params_from(rep["sift_fit"])
 
@@ -467,7 +530,7 @@ def evaluate_run(seq, records, fail_px=8.0):
 def compare(work: Path, fusions=FUSIONS, accel_sigma=1.5):
     tap_cal, sift_par = calibrated_params(work)
     results = {}
-    for name in SEQUENCES:
+    for name in [n for n, c in SEQUENCES.items() if "pillars" not in c]:
         seq = load(work, name)
         with open(work / f"{name}_tap.pkl", "rb") as f:
             raws = pickle.load(f)
@@ -490,40 +553,184 @@ def compare(work: Path, fusions=FUSIONS, accel_sigma=1.5):
     return results
 
 
-def demo(work: Path, out_dir: Path, name="test", per_category=1, width=960):
-    """Render a held-out sequence with the truth drawn (white ring + dotted
-    error in the timelines) for a few targets per surface category."""
+def _render_demo(seq, records, targets, pick, names, path, width, focus):
+    from siftap.focus import render_focus
     from siftap.render import render_frames, write_video
 
-    seq = load(work, name)
-    with open(work / f"{name}_tap.pkl", "rb") as f:
+    recs = [records[k] for k in pick]
+    tgts = [targets[k] for k in pick]
+    truth = seq["gt_xy"][:, pick]
+    # Draw the truth whenever it is in the image, also behind occluders:
+    # that is where a predicted (hidden) position should be.
+    height, width_px = seq["frames"][0].shape[:2]
+    visible = (
+        (truth[..., 0] >= 0)
+        & (truth[..., 0] < width_px)
+        & (truth[..., 1] >= 0)
+        & (truth[..., 1] < height)
+    )
+    video = render_frames(
+        seq["frames"],
+        recs,
+        tgts,
+        names,
+        width=width,
+        truth=truth,
+        truth_visible=visible,
+    )
+    if focus:
+        video = render_focus(
+            video,
+            seq["frames"],
+            recs,
+            tgts,
+            names,
+            list(range(len(pick))),
+            half=32.0,
+            truth=truth,
+            truth_visible=visible,
+        )
+    frames = list(video)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_video(frames, path.with_suffix(".mp4"), fps=8)
+    LOGGER.info("demo written to %s", path.with_suffix(".mp4"))
+
+
+def demo(work: Path, out_dir: Path, width=720):
+    """Held-out synthetic demos with the truth drawn (white ring in the
+    frame and in the stabilized focus panels, dotted error in the
+    timelines).
+
+    * ``test``: one target per surface category, default settings.
+    * ``occl``: three targets that pass behind pillars, once per occlusion
+      policy (predict / drop).
+    """
+    seq = load(work, "test")
+    with open(work / "test_tap.pkl", "rb") as f:
         raws = pickle.load(f)
     targets = make_targets(seq)
-    tracker = SiftapTracker(targets, None, TrackerOptions(fusion="kalman"))
-    records = tracker.run(seq["frames"], tap_raw=raws)
+    records = SiftapTracker(targets, None, TrackerOptions()).run(
+        seq["frames"], tap_raw=raws
+    )
     cats = np.array(seq["categories"])
     pick = []
     for c in CATEGORIES:
         idx = np.flatnonzero(cats == c)
         # Longest visible; ties: the first sampled.
-        order = sorted(idx, key=lambda k: -int(seq["gt_vis"][:, k].sum()))
-        pick += order[:per_category]
-    names = [f"{cats[k]}" for k in pick]
-    frames = list(
-        render_frames(
-            seq["frames"],
-            [records[k] for k in pick],
-            [targets[k] for k in pick],
-            names,
-            width=width,
-            truth=seq["gt_xy"][:, pick],
-            truth_visible=seq["gt_vis"][:, pick],
-        )
+        pick += sorted(idx, key=lambda k: -int(seq["gt_vis"][:, k].sum()))[:1]
+    _render_demo(
+        seq,
+        records,
+        targets,
+        pick,
+        [str(cats[k]) for k in pick],
+        out_dir / "siftap_synthetic_test",
+        width,
+        focus=True,
     )
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_video(frames, out_dir / f"siftap_synthetic_{name}.mp4", fps=8)
-    write_video(frames[::2], out_dir / f"siftap_synthetic_{name}.gif", fps=4)
-    LOGGER.info("demo written to %s", out_dir)
+    seq = load(work, "occl")
+    with open(work / "occl_tap.pkl", "rb") as f:
+        raws = pickle.load(f)
+    targets = make_targets(seq)
+    vis = seq["gt_vis"]
+    # Targets with the most hide-and-reappear episodes (one per category
+    # where possible).
+    episodes = (vis[:-1] & ~vis[1:]).sum(0)
+    cats = np.array(seq["categories"])
+    pick = []
+    for c in ("poster", "facade", "ground", "sky"):
+        idx = [k for k in np.flatnonzero(cats == c) if episodes[k] > 0]
+        if idx and len(pick) < 3:
+            pick.append(max(idx, key=lambda k: episodes[k]))
+    for policy in ("predict", "drop"):
+        records = SiftapTracker(
+            targets, None, TrackerOptions(occlusion=policy)
+        ).run(seq["frames"], tap_raw=raws)
+        _render_demo(
+            seq,
+            records,
+            targets,
+            pick,
+            [str(cats[k]) for k in pick],
+            out_dir / f"siftap_occlusion_{policy}",
+            width,
+            focus=True,
+        )
+
+
+def occlusion_eval(work: Path, thresholds=(0.0, 0.25, 0.5, 0.75, 0.9)):
+    """Occlusion policies on the held-out sequences.
+
+    One tracker run per policy; the reporting threshold only decides which
+    frames are reported, so every threshold is evaluated from that run.
+    Frames are split by the truth: visible, or hidden but inside the image.
+    """
+    from siftap.tracker import frame_status
+
+    tap_cal, sift_par = calibrated_params(work)
+    out = {}
+    for name in [n for n in SEQUENCES if n not in CALIBRATION]:
+        seq = load(work, name)
+        with open(work / f"{name}_tap.pkl", "rb") as f:
+            raws = pickle.load(f)
+        height, width = seq["frames"][0].shape[:2]
+        gt, vis = seq["gt_xy"], seq["gt_vis"]
+        for policy in ("predict", "drop"):
+            opts = TrackerOptions(fusion="kalman", occlusion=policy)
+            records = SiftapTracker(
+                make_targets(seq), None, opts, tap_cal, sift_par
+            ).run(seq["frames"], tap_raw=raws)
+            for x in thresholds:
+                acc = {"visible": [], "hidden": []}
+                resume = []
+                for k, recs in enumerate(records):
+                    gap = None
+                    for r in recs[1:]:
+                        t = r.frame
+                        gx, gy = gt[t, k]
+                        if not (0 <= gx < width and 0 <= gy < height):
+                            gap = None
+                            continue
+                        st = frame_status(r.hidden, r.confidence, policy, x)
+                        part = "visible" if vis[t, k] else "hidden"
+                        e = float(np.linalg.norm(r.fused.position - gt[t, k]))
+                        acc[part].append((st != "dropped", e, r.fused.radius()))
+                        # Frames from reappearance to being reported again.
+                        if not vis[t, k]:
+                            gap = 0
+                        elif gap is not None:
+                            if st != "dropped":
+                                resume.append(gap)
+                                gap = None
+                            else:
+                                gap += 1
+                row = {}
+                for part, items in acc.items():
+                    if not items:
+                        continue
+                    rep_ = [(e, r) for ok, e, r in items if ok]
+                    errs = np.array([e for e, _ in rep_])
+                    row[part] = {
+                        "n": len(items),
+                        "reported%": 100 * len(rep_) / len(items),
+                        "median": float(np.median(errs)) if rep_ else None,
+                        "p90": float(np.quantile(errs, 0.9)) if rep_ else None,
+                        "fail%": float(100 * np.mean(errs > 8))
+                        if rep_
+                        else None,
+                        "cover95%": float(
+                            100 * np.mean([e <= r for e, r in rep_])
+                        )
+                        if rep_
+                        else None,
+                    }
+                row["resume_frames"] = (
+                    float(np.mean(resume)) if resume else None
+                )
+                out[f"{name}/{policy}/{x}"] = row
+                LOGGER.info("%s %s x=%.2f %s", name, policy, x, row)
+    (work / "occlusion.json").write_text(json.dumps(out, indent=1))
+    return out
 
 
 FUSION_LABELS = {
@@ -586,7 +793,11 @@ def tables(work: Path) -> str:
             lines.append(
                 f"| {label} | {seq} | " + " | ".join(cells(tf[key][seq])) + " |"
             )
-    for seq in [n for n in SEQUENCES if n not in CALIBRATION]:
+    for seq in [
+        n
+        for n, c in SEQUENCES.items()
+        if n not in CALIBRATION and "pillars" not in c
+    ]:
         lines += [
             "",
             f"**Fusion on the held-out `{seq}` sequence** (all 40 targets):",
@@ -620,6 +831,37 @@ def tables(work: Path) -> str:
                 for c in CATEGORIES
             ]
             lines.append(f"| {FUSION_LABELS[f]} | " + " | ".join(row) + " |")
+    occ_path = work / "occlusion.json"
+    if occ_path.exists():
+        occ = json.loads(occ_path.read_text())
+        lines += [
+            "",
+            "**Occlusion policies on `occl`** (60 hide-and-reappear episodes, "
+            "617 hidden frames; confidence = P(error <= 4 px)):",
+            "",
+            "| policy | x | visible frames reported | visible: fail % "
+            "| hidden frames reported | hidden: median err px | hidden: fail % "
+            "| hidden: truth in circle | frames to resume |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+
+        def num(v, fmt):
+            return "-" if v is None else fmt.format(v)
+
+        for policy in ("predict", "drop"):
+            for x in (0.0, 0.5, 0.9):
+                r = occ.get(f"occl/{policy}/{x}")
+                if r is None:
+                    continue
+                v, h = r["visible"], r["hidden"]
+                lines.append(
+                    f"| {policy} | {100 * x:.0f} % | {v['reported%']:.0f} % "
+                    f"| {num(v['fail%'], '{:.1f}')} "
+                    f"| {h['reported%']:.0f} % | {num(h['median'], '{:.2f}')} "
+                    f"| {num(h['fail%'], '{:.1f}')} "
+                    f"| {num(h['cover95%'], '{:.0f} %')} "
+                    f"| {num(r['resume_frames'], '{:.2f}')} |"
+                )
     text = "\n".join(lines)
     (work / "tables.md").write_text(text)
     return text
@@ -646,6 +888,8 @@ def main():
         calibrate(work)
     if args.stage in ("compare", "all"):
         compare(work)
+    if args.stage in ("occlusion", "all"):
+        occlusion_eval(work)
     if args.stage in ("demo", "all"):
         demo(work, Path(args.output_path))
     if args.stage in ("tables", "all"):
