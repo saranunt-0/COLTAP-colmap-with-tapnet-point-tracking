@@ -59,3 +59,38 @@ downstream module work unchanged ("same input, same output").
    Dynamic points violate the background epipolar geometry.
 5. **Pairing schedule = COLMAP sequential matcher** (overlap 10 + quadratic),
    so COLTAP and the SIFT baseline are compared on identical image pairs.
+
+## SIFTAP (`siftap/`, branch `SIFTAP`)
+
+Single-video tracking of user-selected points/areas by fusing SIFT and
+TAPNext++; no SfM. Reuses `coltap.model` (TAPNext++ online step, now also
+returning the heatmap spread `sigma_local` / `sigma_global`).
+
+```
+frame t ──► TapFrontEnd (TAPNext++ on target + support points)
+        │      position, heatmap sigma, texture drift rate ──┐
+        └─► SiftFrontEnd (keypoints near the predicted pos.,  │
+               ratio test, RANSAC similarity, LS covariance,  │
+               P(mismatch))                                   ▼
+                                        KalmanFusion [x, v, TAP drift]
+                                        gate + mixture update
+                                                 │
+                     FrameRecord(prior, tap, sift, fused) ──► render (95 % circles)
+```
+
+| File | Role |
+|------|------|
+| `siftap/geometry.py` | `Measurement` (core cov + outlier mixture + drift rate), mixture 95 % radius, inlier posterior, robust similarity fit |
+| `siftap/targets.py` | Point / area targets, support points, `x,y[,w,h]` parsing |
+| `siftap/tap.py` | TAPNext++ front-end, heatmap calibration, texture-driven drift (`texture_sigma`) |
+| `siftap/sift.py` | SIFT front-end: reference + adaptive keyframe, mismatch logistic model |
+| `siftap/fusion.py` | Baselines (`tap`, `sift`, `best`, `ivw`, `bayes`) and `KalmanFusion` variants |
+| `siftap/tracker.py` | Per-frame loop: predict, measure (SIFT window from the prior), fuse, keyframes |
+| `siftap/render.py` | GPS-style circles, gate marks, trails, radius timelines, truth overlay |
+| `siftap/select.py`, `siftap/cli.py` | Interactive selection and `siftap track` |
+| `siftap/city.py`, `benchmark/evaluate.py` | Synthetic street scene with GT; calibration, comparison, demo |
+
+Key decisions: uncertainties are calibrated on held-in synthetic sequences
+by per-cell 95 % coverage of the *drawn* circle; SIFT errors are a mixture,
+not a Gaussian; TAP errors are white noise + texture-driven drift, which
+SIFT (anchored to frame 0) makes observable.
