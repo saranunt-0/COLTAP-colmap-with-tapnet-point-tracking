@@ -1,9 +1,12 @@
 # development_note/index.yaml
-last_updated: "2026-10-05"
+last_updated: "2026-11-10"
 modules:
   - name: coltap
     path: modules/coltap/timeline.md
     description: "TAPNext++ point tracking as drop-in COLMAP correspondence search; selection weights; benchmarks"
+  - name: siftap
+    path: modules/siftap/timeline.md
+    description: "SIFT + TAPNext++ fused tracking of user-selected targets with calibrated 95 % uncertainty radius; research on error models and fusion"
 standalone:
   - name: architecture
     path: architecture.md

@@ -7,6 +7,11 @@ COLMAP
 > writes a standard COLMAP database, so the mapper and all downstream modules
 > run unchanged. See [`coltap/README.md`](coltap/README.md) for usage, results
 > and limitations.
+>
+> **SIFTAP:** [`siftap/`](siftap/) tracks user-selected points or areas in a
+> video by fusing SIFT and TAPNext++ in a Kalman filter, and draws a
+> calibrated GPS-style 95 % uncertainty radius. See
+> [`siftap/README.md`](siftap/README.md).
 
 About
 -----
