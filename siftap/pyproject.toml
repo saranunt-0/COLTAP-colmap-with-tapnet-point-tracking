@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "siftap"
+version = "0.1.0"
+description = "Track user-selected points/areas by fusing SIFT and TAPNext++ with calibrated uncertainty"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause" }
+dependencies = [
+    "coltap",
+    "numpy",
+    "opencv-python-headless",
+    "imageio",
+    "imageio-ffmpeg",
+]
+
+[project.optional-dependencies]
+# Interactive --select needs an OpenCV build with windows: replace the
+# headless wheel (both install cv2), see README.
+test = ["pytest>=8"]
+
+[project.scripts]
+siftap = "siftap.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["siftap*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "-q"]
